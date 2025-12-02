@@ -2,7 +2,7 @@
 require("dotenv").config({ path: ".env.local" });
 require("dotenv").config();
 
-// ⚠️ Ignorar errores de certificados (necesario para entornos de desarrollo/ciertos VPS)
+// ⚠️ Ignorar errores de certificados
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const express = require("express");
@@ -44,11 +44,32 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const sessions = new Map();
 
 // ---------------------------------------------------------------------
-// 1. GESTIÓN DE PLANTILLAS (La clave de tu SaaS)
+// 1. CEREBRO DEL NEGOCIO (Contexto y Plantillas)
 // ---------------------------------------------------------------------
 
 /**
- * Busca una plantilla activa en tu tabla 'message_templates'
+ * NUEVO: Obtiene la identidad del negocio desde la DB
+ */
+async function getTenantContext(tenantId) {
+  try {
+    const { data, error } = await supabase
+      .from("tenants")
+      .select("name, vertical, description") // Leemos las columnas nuevas
+      .eq("id", tenantId)
+      .maybeSingle();
+
+    if (error || !data) {
+      return { name: "el negocio", vertical: "general", description: "" };
+    }
+    return data;
+  } catch (e) {
+    logger.error(e, "Error obteniendo contexto del tenant");
+    return { name: "el negocio", vertical: "general", description: "" };
+  }
+}
+
+/**
+ * Busca una plantilla activa en 'message_templates'
  */
 async function getTemplate(tenantId, eventKey) {
   try {
@@ -56,8 +77,8 @@ async function getTemplate(tenantId, eventKey) {
       .from("message_templates")
       .select("body")
       .eq("tenant_id", tenantId)
-      .eq("event", eventKey) // Ej: 'pricing_pitch', 'booking_confirmed'
-      .eq("active", true)    // Solo si está activa
+      .eq("event", eventKey)
+      .eq("active", true)
       .maybeSingle();
 
     if (error) {
@@ -72,7 +93,7 @@ async function getTemplate(tenantId, eventKey) {
 }
 
 /**
- * Rellena las variables {{customer_name}}, {{date}}, etc.
+ * Rellena variables {{variable}}
  */
 function renderTemplate(body, variables = {}) {
   if (!body) return "";
@@ -82,46 +103,54 @@ function renderTemplate(body, variables = {}) {
 }
 
 // ---------------------------------------------------------------------
-// 2. LÓGICA DE INTELIGENCIA HÍBRIDA (IA + Plantillas)
+// 2. LÓGICA DE INTELIGENCIA HÍBRIDA (IA + Contexto + Plantillas)
 // ---------------------------------------------------------------------
 
 async function generateReply(text, tenantId) {
   const cleanText = text.trim();
   const lower = cleanText.toLowerCase();
 
-  // --- REGLA 1: DETECTAR INTENCIÓN DE PRECIOS/PLANES ---
-  // Si el cliente pregunta precios, intentamos usar TU plantilla primero.
+  // --- REGLA 1: DETECTAR INTENCIÓN DE PRECIOS ---
   const priceKeywords = ["precio", "costo", "cuanto vale", "planes", "tarifa"];
   const isPriceQuestion = priceKeywords.some((kw) => lower.includes(kw));
 
   if (isPriceQuestion) {
-    // Buscamos la plantilla con event = 'pricing_pitch' (como en tu captura)
+    // Buscamos plantilla de precios
     const templateBody = await getTemplate(tenantId, "pricing_pitch");
-    
     if (templateBody) {
-      logger.info({ tenantId }, "🎯 Usando Plantilla de PRECIOS (pricing_pitch)");
-      // Renderizamos sin variables extra, o podrías pasar el nombre si lo tienes
+      logger.info({ tenantId }, "🎯 Usando Plantilla de PRECIOS");
       return renderTemplate(templateBody, {});
     }
-    // Si no tienes plantilla de precios activa, caerá en la IA abajo.
   }
 
-  // --- REGLA 2: CHAT GENERAL CON OPENAI ---
-  // Si no es una plantilla, usamos GPT para responder amablemente
+  // --- REGLA 2: CHAT CONTEXTUAL CON OPENAI ---
+  
+  // 1. Averiguamos quién es el negocio
+  const context = await getTenantContext(tenantId);
+  
+  // 2. Construimos el Prompt Dinámico
+  const systemPrompt = `
+    Eres el asistente virtual de "${context.name || 'un negocio'}".
+    
+    TIPO DE NEGOCIO: ${context.vertical || 'Comercio general'}.
+    DESCRIPCIÓN: ${context.description || 'Ofrecemos servicios y productos de calidad.'}
+
+    OBJETIVO:
+    - Responder dudas basándote estrictamente en el tipo de negocio (${context.vertical}).
+    - Si es barbería, habla de cortes. Si es clínica, habla de doctores.
+    - Sé amable, breve y usa español latino.
+    - Tu meta final es invitar a agendar una cita.
+    - Si no sabes la respuesta, sugiere contactar a un humano.
+  `.trim();
+
   try {
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        {
-          role: "system",
-          content: `Eres el asistente virtual de un negocio. 
-          Tu objetivo es agendar citas y responder dudas básicas.
-          Responde de forma corta, amable y profesional.
-          Si te preguntan algo que no sabes, sugiere contactar a un humano.`,
-        },
+        { role: "system", content: systemPrompt },
         { role: "user", content: cleanText },
       ],
-      max_tokens: 250,
+      max_tokens: 300,
     });
     return completion.choices?.[0]?.message?.content?.trim();
   } catch (err) {
@@ -131,24 +160,21 @@ async function generateReply(text, tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 3. ACTUALIZAR ESTADO EN DB (Tus tablas reales)
+// 3. ACTUALIZAR ESTADO EN DB
 // ---------------------------------------------------------------------
 
 async function updateSessionDB(tenantId, updateData) {
   try {
-    // Actualizamos 'whatsapp_sessions' usando las columnas de tu captura
     await supabase
       .from("whatsapp_sessions")
       .update(updateData)
       .eq("tenant_id", tenantId);
       
-    // Opcional: Si usas la tabla 'tenants' para mostrar "Conectado: Sí/No"
     if (updateData.status === 'connected') {
         await supabase.from("tenants").update({ wa_connected: true }).eq("id", tenantId);
     } else if (updateData.status === 'disconnected') {
         await supabase.from("tenants").update({ wa_connected: false }).eq("id", tenantId);
     }
-
   } catch (err) {
     logger.error({ err }, "Error actualizando DB");
   }
@@ -159,26 +185,21 @@ async function updateSessionDB(tenantId, updateData) {
 // ---------------------------------------------------------------------
 
 async function getOrCreateSession(tenantId) {
-  // Si ya existe en memoria y está OK, la devolvemos
   const existing = sessions.get(tenantId);
   if (existing && existing.socket) return existing;
 
   logger.info({ tenantId }, "🔌 Iniciando Socket...");
 
-  // Imports dinámicos
   const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
-  // ¡IMPORTANTE! Asegúrate que la ruta sea correcta a tu archivo .mjs
   const { useSupabaseAuthState } = await import("./utils/supabaseAuthState.mjs");
 
-  // 1. Usar tu adaptador de Supabase (lee/escribe en 'auth_state')
   const { state, saveCreds } = await useSupabaseAuthState(supabase, tenantId);
 
-  // 2. Crear Socket
   const sock = makeWASocket({
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ["PymeBot", "Chrome", "1.0.0"], // Nombre personalizado
+    browser: ["PymeBot", "Chrome", "1.0.0"],
     syncFullHistory: false,
     connectTimeoutMs: 60000,
   });
@@ -186,37 +207,33 @@ async function getOrCreateSession(tenantId) {
   const info = { tenantId, socket: sock, status: "connecting", qr: null };
   sessions.set(tenantId, info);
 
-  // 3. Manejo de Eventos
   sock.ev.on("connection.update", async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
-    // -- QR GENERADO --
     if (qr) {
       info.status = "qrcode";
       info.qr = qr;
       logger.info({ tenantId }, "✨ QR Generado");
       
-      // Guardar en DB para que tu Frontend lo muestre
       await updateSessionDB(tenantId, {
         qr_data: qr,
         status: "qrcode",
         last_seen_at: new Date().toISOString()
       });
-      qrcode.generate(qr, { small: true });
+      // Descomenta si quieres verlo en terminal local
+      // qrcode.generate(qr, { small: true }); 
     }
 
-    // -- CONECTADO --
     if (connection === "open") {
       info.status = "connected";
       info.qr = null;
       logger.info({ tenantId }, "✅ Conectado");
 
-      // Obtener número
       let phone = sock?.user?.id ? sock.user.id.split(":")[0] : null;
 
       await updateSessionDB(tenantId, {
         status: "connected",
-        qr_data: null, // Limpiar QR
+        qr_data: null,
         phone_number: phone,
         last_connected_at: new Date().toISOString(),
         last_seen_at: new Date().toISOString(),
@@ -224,7 +241,6 @@ async function getOrCreateSession(tenantId) {
       });
     }
 
-    // -- DESCONECTADO --
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
@@ -233,16 +249,14 @@ async function getOrCreateSession(tenantId) {
       logger.warn({ tenantId, statusCode }, "❌ Conexión cerrada");
 
       if (shouldReconnect) {
-        // Reintentar (Fix error 515)
         sessions.delete(tenantId);
         getOrCreateSession(tenantId);
       } else {
-        // Logout real
         sessions.delete(tenantId);
         await updateSessionDB(tenantId, {
           status: "disconnected",
           qr_data: null,
-          auth_state: null, // Borrar sesión
+          auth_state: null,
           last_error: `Logout: ${errorMsg}`
         });
       }
@@ -251,18 +265,17 @@ async function getOrCreateSession(tenantId) {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // 4. Escuchar Mensajes (IA + Plantilla Precios)
   sock.ev.on("messages.upsert", async (m) => {
     const msg = m.messages?.[0];
     if (!msg?.message || msg.key.fromMe) return;
     
     const remoteJid = msg.key.remoteJid;
-    if (remoteJid.includes("@g.us")) return; // No grupos
+    if (remoteJid.includes("@g.us")) return; 
 
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
     if (!text) return;
 
-    // Generar respuesta
+    // Generar respuesta Híbrida
     const reply = await generateReply(text, tenantId);
 
     if (reply) {
@@ -275,12 +288,11 @@ async function getOrCreateSession(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 5. API ENDPOINTS (Para tu Frontend Next.js)
+// 5. API ENDPOINTS
 // ---------------------------------------------------------------------
 
 app.get("/health", (req, res) => res.json({ ok: true, active_sessions: sessions.size }));
 
-// Iniciar sesión (Genera QR)
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const { tenantId } = req.params;
   try {
@@ -291,15 +303,11 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
   }
 });
 
-// Obtener estado actual
 app.get("/sessions/:tenantId", async (req, res) => {
   const { tenantId } = req.params;
-  
-  // 1. Intentar memoria
   const mem = sessions.get(tenantId);
   if (mem) return res.json({ ok: true, status: mem.status, qr: mem.qr });
 
-  // 2. Si no está en memoria, consultar DB
   const { data } = await supabase
     .from("whatsapp_sessions")
     .select("status, qr_data")
@@ -313,7 +321,6 @@ app.get("/sessions/:tenantId", async (req, res) => {
   });
 });
 
-// Desconectar
 app.post("/sessions/:tenantId/disconnect", async (req, res) => {
   const { tenantId } = req.params;
   const s = sessions.get(tenantId);
@@ -329,54 +336,39 @@ app.post("/sessions/:tenantId/disconnect", async (req, res) => {
   res.json({ ok: true });
 });
 
-/**
- * 🔥 ENDPOINT CRÍTICO: ENVIAR PLANTILLA (API TRIGGER)
- * Este es el que usarás cuando se cree una cita en tu sistema
- */
 app.post("/sessions/:tenantId/send-template", async (req, res) => {
   const { tenantId } = req.params;
   const { event, phone, variables } = req.body; 
-  // event ej: 'booking_confirmed'
-  // phone ej: '1809...'
-  // variables ej: { customer_name: 'Juan', date: '...' }
 
   if (!event || !phone) return res.status(400).json({ error: "Faltan datos" });
 
-  // Verificar si hay sesión activa
   let session = sessions.get(tenantId);
   if (!session || session.status !== 'connected') {
-      // Intento de reconexión rápida si está en DB
       try { session = await getOrCreateSession(tenantId); } catch(e){}
   }
 
   if (!session || session.status !== 'connected') {
-      return res.status(400).json({ error: "Bot no conectado. Escanea el QR primero." });
+      return res.status(400).json({ error: "Bot no conectado." });
   }
 
-  // 1. Obtener plantilla de DB
   const templateBody = await getTemplate(tenantId, event);
   if (!templateBody) {
-      return res.status(404).json({ error: `No existe plantilla activa para el evento: ${event}` });
+      return res.status(404).json({ error: `Plantilla no encontrada: ${event}` });
   }
 
-  // 2. Renderizar
   const message = renderTemplate(templateBody, variables || {});
-
-  // 3. Formatear teléfono (Solo números + @s.whatsapp.net)
   const formattedPhone = phone.replace(/\D/g, "") + "@s.whatsapp.net";
 
-  // 4. Enviar
   try {
-      await session.socket.sendMessage(formattedPhone, { text: message });
-      logger.info({ tenantId, event, phone }, "📨 Plantilla enviada exitosamente");
-      res.json({ ok: true, message });
+    await session.socket.sendMessage(formattedPhone, { text: message });
+    logger.info({ tenantId, event, phone }, "📨 Plantilla enviada");
+    res.json({ ok: true, message });
   } catch (e) {
-      logger.error({ e }, "Fallo enviando mensaje");
-      res.status(500).json({ error: "Error de conexión con WhatsApp" });
+    logger.error({ e }, "Fallo enviando mensaje");
+    res.status(500).json({ error: "Error de conexión con WhatsApp" });
   }
 });
 
-// Arrancar
 app.listen(PORT, () => {
   logger.info(`🚀 Bot Server Listo en puerto ${PORT}`);
 });
