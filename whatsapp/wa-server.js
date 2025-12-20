@@ -1,9 +1,8 @@
 /**
  * whatsapp/wa-server.js (ACTUALIZADO)
  * ✅ FIX: disponibilidad y agendado 100% DB-driven (business_hours + bookings)
- * ✅ FIX: NO offset manual (SERVER_OFFSET_HOURS eliminado del cálculo)
  * ✅ FIX: timezone real (America/Santo_Domingo) aunque el server esté en UTC
- * ✅ FIX: create_booking valida business hours + colisiones + asigna barbero automático + turno + cupo diario
+ * ✅ n8n integrado como cerebro principal (webhook) + fallback OpenAI Tools
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -21,7 +20,7 @@ const fs = require("fs");
 const axios = require("axios");
 
 // Date-fns
-const { addDays, startOfDay } = require("date-fns");
+const { addDays } = require("date-fns");
 
 // 👇 estado de conversación en Supabase
 const convoState = require("./conversationState");
@@ -34,25 +33,23 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
-// ⚠️ Ya NO se usa para ajustar horas (antes rompía todo).
-// Lo dejamos por compatibilidad con tu config actual.
-const SERVER_OFFSET_HOURS = 0;
-
-// Timezone configurable (fallback RD)
+const SERVER_OFFSET_HOURS = 0; // compat
 const TIMEZONE_LOCALE = process.env.TIMEZONE_LOCALE || "America/Santo_Domingo";
 
-// Turnos máximos por recurso por día
 const MAX_TURNS_PER_RESOURCE_PER_DAY = Number(
   process.env.MAX_TURNS_PER_RESOURCE_PER_DAY || 10
 );
 
-// Duración default de cita
 const DEFAULT_APPOINTMENT_MINUTES = Number(
   process.env.DEFAULT_APPOINTMENT_MINUTES || 60
 );
 
-// Step slots (min)
 const SLOT_STEP_MINUTES = Number(process.env.SLOT_STEP_MINUTES || 30);
+
+// ✅ n8n
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || ""; // ej: https://tu-n8n.com/webhook/wa-bot
+const N8N_WEBHOOK_SECRET = process.env.N8N_WEBHOOK_SECRET || ""; // recomendado
+const N8N_TIMEOUT_MS = Number(process.env.N8N_TIMEOUT_MS || 60000);
 
 const logger = P({
   transport: {
@@ -97,7 +94,7 @@ const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
  */
 const sessions = new Map();
 
-// Definimos la carpeta donde se guardarán las sesiones (Persistencia)
+// Carpeta sesiones
 const WA_SESSIONS_ROOT =
   process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
 
@@ -145,10 +142,6 @@ function getZonedParts(date, timeZone) {
   };
 }
 
-/**
- * Offset en minutos del timezone respecto a UTC en ese instante.
- * (localTimeAsUTC - actualUTC) / 60000
- */
 function getTimeZoneOffsetMinutes(date, timeZone) {
   const p = getZonedParts(date, timeZone);
   const localAsUTC = Date.UTC(
@@ -162,10 +155,6 @@ function getTimeZoneOffsetMinutes(date, timeZone) {
   return (localAsUTC - date.getTime()) / 60000;
 }
 
-/**
- * Convierte un "local date-time" (componentes) en TZ a Date (UTC real).
- * Itera 2 veces por seguridad (DST). RD casi nunca cambia, pero lo dejamos robusto.
- */
 function zonedDateTimeToUtc({ year, month, day, hour, minute, second }, timeZone) {
   const guessUTC = Date.UTC(year, month - 1, day, hour, minute, second || 0);
   const offset1 = getTimeZoneOffsetMinutes(new Date(guessUTC), timeZone);
@@ -177,25 +166,21 @@ function zonedDateTimeToUtc({ year, month, day, hour, minute, second }, timeZone
   return new Date(utc2);
 }
 
-/**
- * Parse flexible:
- * - "YYYY-MM-DD" => local midnight en TZ
- * - ISO datetime => Date normal
- */
 function parseRequestedDate(input, timeZone) {
   const s = String(input || "").trim();
   if (!s) return new Date();
 
-  // YYYY-MM-DD
   const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (m) {
     const year = Number(m[1]);
     const month = Number(m[2]);
     const day = Number(m[3]);
-    return zonedDateTimeToUtc({ year, month, day, hour: 0, minute: 0, second: 0 }, timeZone);
+    return zonedDateTimeToUtc(
+      { year, month, day, hour: 0, minute: 0, second: 0 },
+      timeZone
+    );
   }
 
-  // ISO / other
   const d = new Date(s);
   if (!isNaN(d.getTime())) return d;
 
@@ -203,8 +188,7 @@ function parseRequestedDate(input, timeZone) {
 }
 
 function formatSlotLabel(dateObj, timeZone) {
-  // Ej: "jue, 18/12 10:30 AM"
-  const parts = dateObj.toLocaleString("es-DO", {
+  return dateObj.toLocaleString("es-DO", {
     timeZone,
     weekday: "short",
     year: "numeric",
@@ -214,18 +198,22 @@ function formatSlotLabel(dateObj, timeZone) {
     minute: "2-digit",
     hour12: true,
   });
-  return parts;
 }
 
 function startOfZonedDay(date, timeZone) {
   const p = getZonedParts(date, timeZone);
-  return zonedDateTimeToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0, second: 0 }, timeZone);
+  return zonedDateTimeToUtc(
+    { year: p.year, month: p.month, day: p.day, hour: 0, minute: 0, second: 0 },
+    timeZone
+  );
 }
 
 function endOfZonedDay(date, timeZone) {
   const p = getZonedParts(date, timeZone);
-  // 23:59:59
-  return zonedDateTimeToUtc({ year: p.year, month: p.month, day: p.day, hour: 23, minute: 59, second: 59 }, timeZone);
+  return zonedDateTimeToUtc(
+    { year: p.year, month: p.month, day: p.day, hour: 23, minute: 59, second: 59 },
+    timeZone
+  );
 }
 
 // =====================================================================
@@ -233,17 +221,13 @@ function endOfZonedDay(date, timeZone) {
 // =====================================================================
 
 function dayOpenWindow(dayDate, businessHours, timeZone) {
-  // dayDate es un instante (Date) — calculamos dow del día en TZ
   const z = getZonedParts(dayDate, timeZone);
-  // Creamos un "Date" equivalente a ese mediodía UTC para que getDay sea estable no depende del server tz.
-  // Mejor: derivar dow usando Intl weekday en TZ.
+
   const weekday = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "short" }).format(dayDate);
-  // Map en-US: Sun, Mon, Tue...
   const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
   const dow = map[weekday] ?? new Date(dayDate).getDay();
 
   const cfg = businessHours.find((bh) => bh.dow === dow && bh.is_closed === false);
-
   if (!cfg || !cfg.open_time || !cfg.close_time) return null;
 
   const { h: openH, m: openM } = hmsToParts(toHHMM(cfg.open_time));
@@ -281,9 +265,7 @@ function generateOfferableSlots(openWindow, bookings, stepMin = 30) {
       return cursor.getTime() < busyEnd.getTime() && slotEnd.getTime() > busyStart.getTime();
     });
 
-    if (!isBusy) {
-      slots.push({ start: new Date(cursor), end: slotEnd });
-    }
+    if (!isBusy) slots.push({ start: new Date(cursor), end: slotEnd });
 
     cursor.setMinutes(cursor.getMinutes() + stepMin);
   }
@@ -304,15 +286,10 @@ async function getBusinessHours(tenantId) {
   return data || [];
 }
 
-/**
- * Devuelve slots desde requestedDate hacia adelante (daysToLookAhead),
- * correctamente por día, respetando business_hours + bookings reales.
- */
 async function getAvailableSlots(tenantId, resourceId, requestedDate, daysToLookAhead = 7) {
   if (!tenantId) return [];
 
   const tz = TIMEZONE_LOCALE;
-
   const base = requestedDate instanceof Date ? requestedDate : parseRequestedDate(requestedDate, tz);
 
   const rangeStart = base;
@@ -320,7 +297,6 @@ async function getAvailableSlots(tenantId, resourceId, requestedDate, daysToLook
 
   const hours = await getBusinessHours(tenantId);
 
-  // Traemos bookings del rango completo 1 vez
   const startISO = rangeStart.toISOString();
   const endISO = rangeEnd.toISOString();
 
@@ -335,9 +311,7 @@ async function getAvailableSlots(tenantId, resourceId, requestedDate, daysToLook
   if (resourceId) q = q.eq("resource_id", resourceId);
 
   const { data: bookings, error } = await q;
-  if (error) {
-    logger.error(error, "[getAvailableSlots] bookings query error");
-  }
+  if (error) logger.error(error, "[getAvailableSlots] bookings query error");
 
   const all = [];
   for (let i = 0; i < daysToLookAhead; i++) {
@@ -345,7 +319,6 @@ async function getAvailableSlots(tenantId, resourceId, requestedDate, daysToLook
     const win = dayOpenWindow(day, hours, tz);
     if (!win) continue;
 
-    // bookings del día
     const dayStart = startOfZonedDay(day, tz).getTime();
     const dayEnd = endOfZonedDay(day, tz).getTime();
 
@@ -358,13 +331,9 @@ async function getAvailableSlots(tenantId, resourceId, requestedDate, daysToLook
     all.push(...slots);
   }
 
-  // Solo slots >= requestedDate
   return all.filter((s) => s.start.getTime() >= base.getTime());
 }
 
-/**
- * Valida que un slot esté dentro del horario del negocio ese día.
- */
 async function validateWithinBusinessHours(tenantId, startDate, endDate) {
   const tz = TIMEZONE_LOCALE;
   const hours = await getBusinessHours(tenantId);
@@ -377,13 +346,6 @@ async function validateWithinBusinessHours(tenantId, startDate, endDate) {
   return { ok: true };
 }
 
-/**
- * Asigna el recurso (barbero) automáticamente:
- * - debe estar activo
- * - no debe estar ocupado en ese slot
- * - no debe superar MAX_TURNS_PER_RESOURCE_PER_DAY
- * - elige el de menor carga (menos bookings ese día)
- */
 async function chooseResourceForSlot(tenantId, startDate, endDate) {
   const tz = TIMEZONE_LOCALE;
 
@@ -399,11 +361,8 @@ async function chooseResourceForSlot(tenantId, startDate, endDate) {
   }
 
   const active = (resources || []).filter((r) => r.is_active);
-  if (active.length === 0) {
-    return { ok: false, reason: "no_active_resources" };
-  }
+  if (active.length === 0) return { ok: false, reason: "no_active_resources" };
 
-  // bookings del día para todos los recursos
   const dayStart = startOfZonedDay(startDate, tz).toISOString();
   const dayEnd = endOfZonedDay(startDate, tz).toISOString();
 
@@ -420,14 +379,10 @@ async function chooseResourceForSlot(tenantId, startDate, endDate) {
     return { ok: false, reason: "bookings_query_error" };
   }
 
-  // Pre-cálculos por recurso
   const byResource = new Map();
   for (const r of active) byResource.set(r.id, []);
-
   for (const b of dayBookings || []) {
-    if (b.resource_id && byResource.has(b.resource_id)) {
-      byResource.get(b.resource_id).push(b);
-    }
+    if (b.resource_id && byResource.has(b.resource_id)) byResource.get(b.resource_id).push(b);
   }
 
   const candidates = [];
@@ -452,11 +407,7 @@ async function chooseResourceForSlot(tenantId, startDate, endDate) {
     }
   }
 
-  if (candidates.length === 0) {
-    return { ok: false, reason: "no_resource_available" };
-  }
-
-  // menor carga
+  if (candidates.length === 0) return { ok: false, reason: "no_resource_available" };
   candidates.sort((a, b) => a.count - b.count);
 
   const chosen = candidates[0];
@@ -574,9 +525,7 @@ async function buildIntentHints(tenantId, userText) {
         row.locale &&
         normalizeForIntent(row.locale) !== normalizeForIntent("es-DO") &&
         normalizeForIntent(row.locale) !== normalizeForIntent("es")
-      ) {
-        continue;
-      }
+      ) continue;
 
       if (row.es_error) continue;
 
@@ -588,9 +537,7 @@ async function buildIntentHints(tenantId, userText) {
 
       if (normalizedUser.includes(normTerm)) {
         const intent = row.intent || "desconocido";
-        if (!scores[intent]) {
-          scores[intent] = { intent, score: 0, terms: new Set() };
-        }
+        if (!scores[intent]) scores[intent] = { intent, score: 0, terms: new Set() };
         const peso = typeof row.peso === "number" ? row.peso : 1;
         scores[intent].score += peso;
         scores[intent].terms.add(term);
@@ -615,7 +562,7 @@ async function buildIntentHints(tenantId, userText) {
 }
 
 // =====================================================================
-// 6. DEFINICIÓN DE TOOLS (OpenAI)
+// 6. DEFINICIÓN DE TOOLS (OpenAI fallback)
 // =====================================================================
 
 const tools = [
@@ -623,8 +570,7 @@ const tools = [
     type: "function",
     function: {
       name: "check_availability",
-      description:
-        "Consulta disponibilidad. Úsalo para ver huecos libres para citas o reservas.",
+      description: "Consulta disponibilidad.",
       parameters: {
         type: "object",
         properties: {
@@ -638,8 +584,7 @@ const tools = [
     type: "function",
     function: {
       name: "create_booking",
-      description:
-        "Crea una Cita, Reserva de Mesa o Pedido Programado. NO pidas serviceId si el cliente no lo especifica.",
+      description: "Crea una cita/reserva.",
       parameters: {
         type: "object",
         properties: {
@@ -647,16 +592,8 @@ const tools = [
           phone: { type: "string" },
           startsAtISO: { type: "string" },
           endsAtISO: { type: "string" },
-          notes: {
-            type: "string",
-            description:
-              "Motivo de la cita, cantidad de personas (si es restaurante) o detalles.",
-          },
-          serviceId: {
-            type: "string",
-            description:
-              "Opcional. Solo si el cliente eligió un servicio específico del catálogo.",
-          },
+          notes: { type: "string" },
+          serviceId: { type: "string" },
         },
         required: ["phone", "startsAtISO"],
       },
@@ -666,8 +603,7 @@ const tools = [
     type: "function",
     function: {
       name: "get_catalog",
-      description:
-        "Consulta el menú, servicios o productos del negocio para dar precios y detalles.",
+      description: "Consulta el catálogo del negocio.",
       parameters: { type: "object", properties: {}, required: [] },
     },
   },
@@ -675,8 +611,7 @@ const tools = [
     type: "function",
     function: {
       name: "human_handoff",
-      description:
-        "Úsalo cuando el cliente pida hablar con una persona real o si no sabes la respuesta.",
+      description: "Escala a humano.",
       parameters: { type: "object", properties: {}, required: [] },
     },
   },
@@ -684,24 +619,13 @@ const tools = [
     type: "function",
     function: {
       name: "reschedule_booking",
-      description:
-        "Reagenda una cita activa del cliente usando su teléfono y nueva fecha/hora.",
+      description: "Reagenda una cita.",
       parameters: {
         type: "object",
         properties: {
-          customerPhone: {
-            type: "string",
-            description: "Teléfono del cliente (WhatsApp).",
-          },
-          newStartsAtISO: {
-            type: "string",
-            description: "Nueva fecha/hora inicio en formato ISO 8601.",
-          },
-          newEndsAtISO: {
-            type: "string",
-            description:
-              "Nueva fecha/hora fin en formato ISO 8601. Opcional; si no se envía se asume 1 hora.",
-          },
+          customerPhone: { type: "string" },
+          newStartsAtISO: { type: "string" },
+          newEndsAtISO: { type: "string" },
         },
         required: ["customerPhone", "newStartsAtISO"],
       },
@@ -711,15 +635,11 @@ const tools = [
     type: "function",
     function: {
       name: "cancel_booking",
-      description:
-        "Cancela la última cita activa de un cliente usando su teléfono.",
+      description: "Cancela la última cita activa.",
       parameters: {
         type: "object",
         properties: {
-          customerPhone: {
-            type: "string",
-            description: "Teléfono del cliente (WhatsApp).",
-          },
+          customerPhone: { type: "string" },
         },
         required: ["customerPhone"],
       },
@@ -728,12 +648,64 @@ const tools = [
 ];
 
 // =====================================================================
-// 7. IA CON CEREBRO DINÁMICO (Lee la DB para saber qué ser)
+// 7A. n8n CLIENT (cerebro principal)
+// =====================================================================
+
+function redact(s) {
+  if (!s) return "";
+  const str = String(s);
+  if (str.length <= 8) return "********";
+  return str.slice(0, 4) + "********" + str.slice(-4);
+}
+
+async function callN8N(payload) {
+  if (!N8N_WEBHOOK_URL) {
+    return { ok: false, error: "n8n_not_configured" };
+  }
+
+  const headers = {
+    "Content-Type": "application/json",
+  };
+
+  // ✅ firma simple opcional
+  if (N8N_WEBHOOK_SECRET) {
+    headers["x-pymebot-secret"] = N8N_WEBHOOK_SECRET;
+  }
+
+  try {
+    logger.info(
+      { n8n: N8N_WEBHOOK_URL, secret: N8N_WEBHOOK_SECRET ? redact(N8N_WEBHOOK_SECRET) : null },
+      "[wa-server] 🧠 Llamando n8n webhook"
+    );
+
+    const resp = await axios.post(N8N_WEBHOOK_URL, payload, {
+      timeout: N8N_TIMEOUT_MS,
+      headers,
+      validateStatus: () => true,
+    });
+
+    if (!resp || !resp.data) {
+      return { ok: false, error: "n8n_empty_response" };
+    }
+
+    // resp.data debe traer { ok, reply, newState, icsData }
+    if (resp.status >= 200 && resp.status < 300) {
+      return resp.data;
+    }
+
+    return { ok: false, error: "n8n_http_error", status: resp.status, data: resp.data };
+  } catch (e) {
+    return { ok: false, error: "n8n_call_failed", detail: e?.message || "unknown" };
+  }
+}
+
+// =====================================================================
+// 7B. IA CON CEREBRO DINÁMICO (fallback OpenAI tools)
 // =====================================================================
 
 async function generateReply(text, tenantId, pushName, historyMessages = [], userPhone = null) {
   if (!openai) {
-    logger.error("[generateReply] OpenAI no está configurado, no puedo generar respuesta IA.");
+    logger.error("[generateReply] OpenAI no está configurado.");
     return null;
   }
 
@@ -747,7 +719,6 @@ async function generateReply(text, tenantId, pushName, historyMessages = [], use
   const botName = profile?.bot_name || "Asistente Virtual";
   const botTone = profile?.bot_tone || "Amable y profesional";
   const customRules = profile?.custom_instructions || "Ayuda al cliente a agendar o comprar.";
-  const humanPhone = profile?.human_handoff_phone || null;
 
   const tz = TIMEZONE_LOCALE;
   const now = new Date();
@@ -762,20 +733,16 @@ async function generateReply(text, tenantId, pushName, historyMessages = [], use
   let typeContext = "";
   switch (businessType) {
     case "restaurante":
-      typeContext =
-        "Eres el host de un restaurante. Tu objetivo es RESERVAR MESAS o TOMAR PEDIDOS. Cuando agendes, en 'notes' guarda la cantidad de personas.";
+      typeContext = "Eres el host de un restaurante. Tu objetivo es RESERVAR MESAS o TOMAR PEDIDOS.";
       break;
     case "clinica":
-      typeContext =
-        "Eres recepcionista médico. Tu objetivo es agendar CITAS. Sé formal y discreto. Pregunta brevemente el motivo y guárdalo en 'notes'.";
+      typeContext = "Eres recepcionista médico. Tu objetivo es agendar CITAS. Sé formal y discreto.";
       break;
     case "barberia":
-      typeContext =
-        "Eres el asistente de una barbería. Agenda citas. Si no especifican barbero, agenda con cualquiera disponible.";
+      typeContext = "Eres el asistente de una barbería. Agenda citas. Si no especifican barbero, agenda con cualquiera disponible.";
       break;
     default:
-      typeContext =
-        "Eres un asistente general de negocios. Tu objetivo es AGENDAR citas o responder dudas.";
+      typeContext = "Eres un asistente general de negocios. Tu objetivo es AGENDAR citas o responder dudas.";
   }
 
   const systemPrompt = `
@@ -826,7 +793,6 @@ INSTRUCCIONES:
         const args = JSON.parse(toolCall.function.arguments || "{}");
         let response;
 
-        // A) CONSULTAR DISPONIBILIDAD
         if (fnName === "check_availability") {
           const baseDate = parseRequestedDate(args.requestedDate, tz);
 
@@ -842,22 +808,17 @@ INSTRUCCIONES:
             }));
 
             response = JSON.stringify({
-              message:
-                "Horarios disponibles. El cliente elige por número. Para agendar usa isoStart/isoEnd del slot.",
+              message: "Horarios disponibles. El cliente elige por número.",
               slots: slotObjects,
               plain_list: slotObjects.map((x) => x.label).join("\n"),
             });
           } else {
             response = JSON.stringify({
-              message:
-                "No hay horarios disponibles desde esa fecha. Pide otro día.",
+              message: "No hay horarios disponibles desde esa fecha. Pide otro día.",
               slots: [],
             });
           }
-        }
-
-        // B) CONSULTAR CATÁLOGO
-        else if (fnName === "get_catalog") {
+        } else if (fnName === "get_catalog") {
           const { data: items } = await supabase
             .from("items")
             .select("name, price_cents, description, type")
@@ -873,23 +834,14 @@ INSTRUCCIONES:
               .join("\n");
             response = JSON.stringify({ catalog: list });
           } else {
-            response = JSON.stringify({
-              message:
-                "El catálogo está vacío. Responde con las reglas del negocio o sugiere soporte humano.",
-            });
+            response = JSON.stringify({ message: "El catálogo está vacío." });
           }
-        }
-
-        // C) CREAR CITA / RESERVA (FIX REAL)
-        else if (fnName === "create_booking") {
+        } else if (fnName === "create_booking") {
           const phoneArg = args.phone || userPhone;
           const startsISO = args.startsAtISO;
 
           if (!phoneArg || !startsISO) {
-            response = JSON.stringify({
-              success: false,
-              error: "missing_phone_or_start",
-            });
+            response = JSON.stringify({ success: false, error: "missing_phone_or_start" });
           } else {
             const start = new Date(startsISO);
             if (isNaN(start.getTime())) {
@@ -902,7 +854,6 @@ INSTRUCCIONES:
               if (isNaN(end.getTime()) || end <= start) {
                 response = JSON.stringify({ success: false, error: "invalid_endsAtISO" });
               } else {
-                // 1) Validar horario negocio
                 const within = await validateWithinBusinessHours(tenantId, start, end);
                 if (!within.ok) {
                   response = JSON.stringify({
@@ -914,7 +865,6 @@ INSTRUCCIONES:
                         : "Ese horario está fuera del horario laboral.",
                   });
                 } else {
-                  // 2) Asignar barbero automático
                   const chosen = await chooseResourceForSlot(tenantId, start, end);
                   if (!chosen.ok) {
                     response = JSON.stringify({
@@ -926,7 +876,6 @@ INSTRUCCIONES:
                           : "No pude asignar un barbero ahora mismo.",
                     });
                   } else {
-                    // 3) Doble-check colisión con ese resource (por seguridad)
                     const { data: collision, error: cErr } = await supabase
                       .from("bookings")
                       .select("id")
@@ -946,7 +895,6 @@ INSTRUCCIONES:
                         message: "Ese horario ya fue ocupado. Elige otro.",
                       });
                     } else {
-                      // 4) Guardar booking REAL
                       const noteFinal = [
                         args.notes || "Agendado por Bot",
                         `Turno #${chosen.turno}`,
@@ -994,10 +942,7 @@ INSTRUCCIONES:
               }
             }
           }
-        }
-
-        // D) PASAR A HUMANO
-        else if (fnName === "human_handoff") {
+        } else if (fnName === "human_handoff") {
           const { data: profile2 } = await supabase
             .from("business_profiles")
             .select("human_handoff_phone")
@@ -1013,14 +958,10 @@ INSTRUCCIONES:
             });
           } else {
             response = JSON.stringify({
-              message:
-                "Ahora mismo no tengo un número de contacto directo configurado. Déjame tu mensaje y te contactamos.",
+              message: "No tengo un número humano configurado. Déjame tu mensaje y te contactamos.",
             });
           }
-        }
-
-        // E) REAGENDAR (mejorado: valida horario + colisión + reasigna barbero si hace falta)
-        else if (fnName === "reschedule_booking") {
+        } else if (fnName === "reschedule_booking") {
           const phoneFilter = args.customerPhone || args.phone || userPhone || null;
 
           if (!phoneFilter) {
@@ -1056,7 +997,6 @@ INSTRUCCIONES:
                   message: "Ese horario no está dentro del horario laboral.",
                 });
               } else {
-                // si el recurso actual está ocupado, reasignamos
                 let resourceId = booking.resource_id || null;
                 let chosen = null;
 
@@ -1117,10 +1057,7 @@ INSTRUCCIONES:
               }
             }
           }
-        }
-
-        // F) CANCELAR (igual)
-        else if (fnName === "cancel_booking") {
+        } else if (fnName === "cancel_booking") {
           const phoneFilter = args.customerPhone || args.phone || userPhone || null;
 
           if (!phoneFilter) {
@@ -1143,16 +1080,9 @@ INSTRUCCIONES:
                 .eq("id", booking.id);
 
               if (!error) {
-                response = JSON.stringify({
-                  success: true,
-                  message: "Cita cancelada correctamente.",
-                });
+                response = JSON.stringify({ success: true, message: "Cita cancelada correctamente." });
               } else {
-                response = JSON.stringify({
-                  success: false,
-                  error: "db_update_error",
-                  detail: error.message,
-                });
+                response = JSON.stringify({ success: false, error: "db_update_error", detail: error.message });
               }
             } else {
               response = JSON.stringify({
@@ -1162,9 +1092,7 @@ INSTRUCCIONES:
               });
             }
           }
-        }
-
-        else {
+        } else {
           response = JSON.stringify({ ok: false, error: "unknown_tool" });
         }
 
@@ -1215,15 +1143,11 @@ async function updateSessionDB(tenantId, updateData) {
         .update(updateData)
         .eq("tenant_id", tenantId);
 
-      if (updateError) {
-        console.error("[updateSessionDB] Error update whatsapp_sessions:", updateError);
-      }
+      if (updateError) console.error("[updateSessionDB] Error update whatsapp_sessions:", updateError);
     } else {
       const row = { tenant_id: tenantId, ...updateData };
       const { error: insertError } = await supabase.from("whatsapp_sessions").insert([row]);
-      if (insertError) {
-        console.error("[updateSessionDB] Error insert whatsapp_sessions:", insertError);
-      }
+      if (insertError) console.error("[updateSessionDB] Error insert whatsapp_sessions:", insertError);
     }
 
     if (updateData.status) {
@@ -1233,9 +1157,7 @@ async function updateSessionDB(tenantId, updateData) {
         .update({ wa_connected: isConnected })
         .eq("id", tenantId);
 
-      if (tenantError) {
-        console.error("[updateSessionDB] Error update tenants.wa_connected:", tenantError);
-      }
+      if (tenantError) console.error("[updateSessionDB] Error update tenants.wa_connected:", tenantError);
     }
   } catch (e) {
     console.error("[updateSessionDB] Error inesperado:", e);
@@ -1304,14 +1226,9 @@ function buildBookingEventFromMessage(text, session) {
   if (currentFlow === "BOOKING") {
     if (step === "SELECT_SERVICE") {
       let serviceId = null;
-      if (lower.includes("corte") && lower.includes("barba")) {
-        serviceId = "service_corte_barba";
-      } else if (lower.includes("corte")) {
-        serviceId = "service_corte";
-      } else if (lower.includes("barba")) {
-        serviceId = "service_barba";
-      }
-
+      if (lower.includes("corte") && lower.includes("barba")) serviceId = "service_corte_barba";
+      else if (lower.includes("corte")) serviceId = "service_corte";
+      else if (lower.includes("barba")) serviceId = "service_barba";
       return { type: "SERVICE_PROVIDED", serviceId };
     }
 
@@ -1329,7 +1246,6 @@ function buildBookingEventFromMessage(text, session) {
 
       const ymd = getZonedParts(target, tz);
       const targetDate = `${ymd.year}-${pad2(ymd.month)}-${pad2(ymd.day)}`;
-
       return { type: "DATE_PROVIDED", date: targetDate };
     }
 
@@ -1360,7 +1276,7 @@ async function useSupabaseAuthState(tenantId) {
 }
 
 // =====================================================================
-// 11. CORE WHATSAPP (Baileys + integración bot Next)
+// 11. CORE WHATSAPP (Baileys + n8n + fallback)
 // =====================================================================
 
 async function getOrCreateSession(tenantId) {
@@ -1472,53 +1388,55 @@ async function getOrCreateSession(tenantId) {
       const customerId = await getOrCreateCustomer(tenantId, userPhone);
       const event = buildBookingEventFromMessage(text, convoSession);
 
-      // URL del bot Next
-      const botApiUrl = "https://bot-suite.onrender.com/api/whatsapp-bot";
-
       let replyText = null;
       let newState = null;
       let icsData = null;
 
-      if (botApiUrl) {
-        const payload = {
-          tenantId,
-          customerId,
-          phoneNumber: userPhone,
-          text,
-          customerName: pushName,
-          state: {
-            current_flow: convoSession.current_flow,
-            step: convoSession.step,
-            payload: convoSession.payload || {},
-          },
-          event,
-        };
+      // ==========================================================
+      // 1) 🧠 n8n (PRIMARY)
+      // ==========================================================
+      const n8nPayload = {
+        tenantId,
+        customerId,
+        phoneNumber: userPhone,
+        text,
+        customerName: pushName,
+        // estado conversacional que YA manejas en DB:
+        state: {
+          current_flow: convoSession.current_flow,
+          step: convoSession.step,
+          payload: convoSession.payload || {},
+        },
+        // evento “normalizado”:
+        event,
+        // contexto runtime útil:
+        meta: {
+          timezone: TIMEZONE_LOCALE,
+          nowISO: new Date().toISOString(),
+          waTenantConnected: info.status,
+        },
+      };
 
-        try {
-          logger.info({ tenantId, url: botApiUrl }, "[wa-server] Llamando a /api/whatsapp-bot");
-          const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
-
-          if (response.data && response.data.ok) {
-            replyText = response.data.reply;
-            newState = response.data.newState;
-            icsData = response.data.icsData;
-          } else {
-            logger.error("[wa-server] Respuesta no OK de /api/whatsapp-bot:", response.data);
-          }
-        } catch (err) {
-          logger.error(
-            "[wa-server] Error al llamar a /api/whatsapp-bot:",
-            err?.response?.data || err.message
-          );
+      const n8nResp = await callN8N(n8nPayload);
+      if (n8nResp && n8nResp.ok) {
+        replyText = String(n8nResp.reply || "").trim() || null;
+        newState = n8nResp.newState || null;
+        icsData = n8nResp.icsData || null;
+      } else {
+        if (n8nResp?.error && n8nResp.error !== "n8n_not_configured") {
+          logger.error({ n8nResp }, "[wa-server] n8n respondió error/no-ok");
         }
       }
 
-      // Fallback OpenAI tools
+      // ==========================================================
+      // 2) fallback OpenAI tools (si n8n falla)
+      // ==========================================================
       if (!replyText) {
         const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
         replyText =
           fallback ||
           "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
+
         newState = {
           current_flow: convoSession.current_flow,
           step: convoSession.step,
@@ -1544,7 +1462,17 @@ async function getOrCreateSession(tenantId) {
 
       // Send ICS if present
       if (icsData) {
-        const icsBuffer = Buffer.from(icsData);
+        // Si viene base64, decodifica. Si viene texto raw, también sirve.
+        let icsBuffer;
+        try {
+          // heurística: si parece base64 (sin saltos, largo), decodifica
+          const maybe = String(icsData);
+          const looksBase64 = /^[A-Za-z0-9+/=]+$/.test(maybe) && maybe.length > 200;
+          icsBuffer = looksBase64 ? Buffer.from(maybe, "base64") : Buffer.from(maybe);
+        } catch (_) {
+          icsBuffer = Buffer.from(String(icsData));
+        }
+
         await sock.sendMessage(remoteJid, {
           document: icsBuffer,
           mimetype: "text/calendar",
@@ -1682,7 +1610,7 @@ app.post("/sessions/:tenantId/send-template", async (req, res) => {
 });
 
 // =====================================================================
-// 14. ENDPOINT: Enviar Media (document/image/audio) desde Next.js
+// 14. ENDPOINT: Enviar Media (document/image/audio) desde Next.js o n8n
 // =====================================================================
 
 app.post("/sessions/:tenantId/send-media", async (req, res) => {
@@ -1823,7 +1751,6 @@ app.post("/api/v1/create-booking", async (req, res) => {
     finalResourceId = chosen.resourceId;
   }
 
-  // colisión final
   const { data: collision } = await supabase
     .from("bookings")
     .select("id")
@@ -1834,9 +1761,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
     .in("status", ["confirmed", "pending"])
     .maybeSingle();
 
-  if (collision) {
-    return res.status(409).json({ ok: false, error: "slot_busy" });
-  }
+  if (collision) return res.status(409).json({ ok: false, error: "slot_busy" });
 
   const finalName = customerName || "Cliente Web";
 
@@ -1873,7 +1798,7 @@ app.post("/api/v1/create-booking", async (req, res) => {
     return res.status(500).json({ ok: false, error: "no_booking_created" });
   }
 
-  // Notificación + ICS
+  // Notificación + ICS (igual que tú)
   try {
     const session = await getOrCreateSession(tenantId);
     if (session && session.status === "connected") {
@@ -1931,11 +1856,11 @@ app.post("/api/v1/create-booking", async (req, res) => {
 });
 
 // =====================================================================
-// 17. API DE REAGENDAMIENTO / CANCELACIÓN (se quedan igual que las tuyas)
+// 17. API DE REAGENDAMIENTO / CANCELACIÓN
 // =====================================================================
 
 app.post("/api/v1/reschedule-booking", async (req, res) => {
-  const { tenantId, bookingId, newStartsAtISO, newEndsAtISO, extraVariables } = req.body || {};
+  const { tenantId, bookingId, newStartsAtISO, newEndsAtISO } = req.body || {};
 
   if (!tenantId || !bookingId || !newStartsAtISO) {
     return res.status(400).json({
@@ -1976,7 +1901,6 @@ app.post("/api/v1/reschedule-booking", async (req, res) => {
     return res.status(404).json({ ok: false, error: "booking_not_found_or_not_owned" });
   }
 
-  // Notificación opcional (igual que tu lógica; la dejamos)
   res.json({
     ok: true,
     booking: {
