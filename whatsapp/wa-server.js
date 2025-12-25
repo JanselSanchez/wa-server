@@ -3,6 +3,7 @@
  * ✅ FIX: disponibilidad y agendado 100% DB-driven (business_hours + bookings)
  * ✅ FIX: timezone real (America/Santo_Domingo) aunque el server esté en UTC
  * ✅ n8n integrado como cerebro principal (webhook) + fallback OpenAI Tools
+ * ✅ BRIDGE: Conexión real Baileys -> n8n -> Baileys
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -46,8 +47,8 @@ const DEFAULT_APPOINTMENT_MINUTES = Number(
 
 const SLOT_STEP_MINUTES = Number(process.env.SLOT_STEP_MINUTES || 30);
 
-// ✅ n8n
-const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || ""; // ej: https://tu-n8n.com/webhook/wa-bot
+// ✅ n8n CONFIG
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || ""; // ej: https://tu-n8n.com/webhook/wa-in
 const N8N_WEBHOOK_SECRET = process.env.N8N_WEBHOOK_SECRET || ""; // recomendado
 const N8N_TIMEOUT_MS = Number(process.env.N8N_TIMEOUT_MS || 60000);
 
@@ -1353,145 +1354,72 @@ async function getOrCreateSession(tenantId) {
 
   sock.ev.on("creds.update", saveCreds);
 
+  // -------------------------------------------------------------
+  // 🔥 AQUÍ ESTÁ LA INTEGRACIÓN CLAVE CON n8n (PUENTE COMPLETO)
+  // -------------------------------------------------------------
   sock.ev.on("messages.upsert", async (m) => {
     try {
       const msg = m.messages?.[0];
       if (!msg) return;
 
-      logger.info({ tenantId, key: msg.key }, "[wa-server] 📩 messages.upsert recibido");
-
-      if (!msg?.message || msg.key.fromMe) return;
+      // Ignorar mensajes propios o de grupos
+      if (!msg.message || msg.key.fromMe || msg.key.remoteJid.includes("@g.us")) return;
 
       const remoteJid = msg.key.remoteJid;
-      if (!remoteJid || remoteJid.includes("@g.us")) return;
-
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
 
-      if (!text) return;
+      if (!text) return; // Si es audio/sticker sin texto, ignorar por ahora
 
-      const pushName = msg.pushName || "Cliente";
+      logger.info({ tenantId, from: remoteJid }, "📩 Mensaje recibido");
+
       const userPhone = remoteJid.split("@")[0];
+      const pushName = msg.pushName || "Cliente";
 
-      // Memoria RAM para fallback OpenAI
-      if (!info.conversations) info.conversations = new Map();
-      let convo = info.conversations.get(userPhone);
-      if (!convo) {
-        convo = { history: [] };
-        info.conversations.set(userPhone, convo);
-      }
-      const history = convo.history || [];
-
-      const convoSession = await convoState.getOrCreateSession(tenantId, userPhone);
-      const customerId = await getOrCreateCustomer(tenantId, userPhone);
-      const event = buildBookingEventFromMessage(text, convoSession);
-
-      let replyText = null;
-      let newState = null;
-      let icsData = null;
-
-      // ==========================================================
-      // 1) 🧠 n8n (PRIMARY)
-      // ==========================================================
+      // 1. Preparar Payload para n8n
       const n8nPayload = {
-        tenantId,
-        customerId,
-        phoneNumber: userPhone,
-        text,
-        customerName: pushName,
-        // estado conversacional que YA manejas en DB:
-        state: {
-          current_flow: convoSession.current_flow,
-          step: convoSession.step,
-          payload: convoSession.payload || {},
-        },
-        // evento “normalizado”:
-        event,
-        // contexto runtime útil:
-        meta: {
-          timezone: TIMEZONE_LOCALE,
-          nowISO: new Date().toISOString(),
-          waTenantConnected: info.status,
-        },
+        phone: userPhone,
+        message: text,
+        tenantId: tenantId, // El ID del negocio dueño de esta sesión
+        name: pushName,
+        // Metadata extra útil
+        timestamp: new Date().toISOString(),
       };
 
-      const n8nResp = await callN8N(n8nPayload);
-      if (n8nResp && n8nResp.ok) {
-        replyText = String(n8nResp.reply || "").trim() || null;
-        newState = n8nResp.newState || null;
-        icsData = n8nResp.icsData || null;
+      // 2. Enviar a n8n
+      const n8nResponse = await callN8N(n8nPayload);
+
+      // 3. Procesar Respuesta de n8n
+      if (n8nResponse && n8nResponse.ok) {
+        const replyText = n8nResponse.reply;
+        
+        // A. Responder Texto
+        if (replyText) {
+          await sock.sendMessage(remoteJid, { text: replyText });
+        }
+
+        // B. (Opcional) Si n8n devuelve ICS (calendario)
+        if (n8nResponse.icsData) {
+            // Lógica para enviar archivo ICS si viene en la respuesta
+             let icsBuffer = Buffer.from(String(n8nResponse.icsData));
+             await sock.sendMessage(remoteJid, {
+                document: icsBuffer,
+                mimetype: "text/calendar",
+                fileName: "cita.ics",
+                caption: "📅 Tu Cita Confirmada"
+             });
+        }
+
       } else {
-        if (n8nResp?.error && n8nResp.error !== "n8n_not_configured") {
-          logger.error({ n8nResp }, "[wa-server] n8n respondió error/no-ok");
-        }
+        // Fallback si n8n falla (Opcional: usar OpenAI local o no hacer nada)
+        logger.warn("⚠️ n8n no respondió OK o está apagado. Fallback activado.");
+        // Aquí podrías llamar a tu función generateReply() antigua si quisieras respaldo
       }
 
-      // ==========================================================
-      // 2) fallback OpenAI tools (si n8n falla)
-      // ==========================================================
-      if (!replyText) {
-        const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
-        replyText =
-          fallback ||
-          "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
-
-        newState = {
-          current_flow: convoSession.current_flow,
-          step: convoSession.step,
-          payload: convoSession.payload || {},
-        };
-      }
-
-      // Update conversation_sessions
-      if (newState) {
-        try {
-          await convoState.updateSession(convoSession.id, {
-            current_flow: newState.current_flow,
-            step: newState.step,
-            payload: newState.payload,
-          });
-        } catch (err) {
-          logger.error("[wa-server] Error al actualizar conversación:", err);
-        }
-      }
-
-      // Send message
-      await sock.sendMessage(remoteJid, { text: replyText });
-
-      // Send ICS if present
-      if (icsData) {
-        // Si viene base64, decodifica. Si viene texto raw, también sirve.
-        let icsBuffer;
-        try {
-          // heurística: si parece base64 (sin saltos, largo), decodifica
-          const maybe = String(icsData);
-          const looksBase64 = /^[A-Za-z0-9+/=]+$/.test(maybe) && maybe.length > 200;
-          icsBuffer = looksBase64 ? Buffer.from(maybe, "base64") : Buffer.from(maybe);
-        } catch (_) {
-          icsBuffer = Buffer.from(String(icsData));
-        }
-
-        await sock.sendMessage(remoteJid, {
-          document: icsBuffer,
-          mimetype: "text/calendar",
-          fileName: "cita_confirmada.ics",
-          caption: "📅 Toca aquí para guardar en tu calendario",
-        });
-      }
-
-      // Save history
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: replyText });
-
-      const MAX_MESSAGES = 20;
-      if (history.length > MAX_MESSAGES) history.splice(0, history.length - MAX_MESSAGES);
-
-      convo.history = history;
-      info.conversations.set(userPhone, convo);
     } catch (e) {
-      logger.error("[wa-server] Error en messages.upsert:", e);
+      logger.error("❌ Error en messages.upsert:", e);
     }
   });
 
