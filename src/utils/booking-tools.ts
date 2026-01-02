@@ -1,5 +1,4 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { tool } from "ai";
 
@@ -9,18 +8,11 @@ const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 if (!supabaseUrl || !supabaseKey) throw new Error("Faltan credenciales Supabase");
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// --- HELPERS (PRODUCCIÓN) ---
-
+// -----------------------------
+// Helpers (prod)
+// -----------------------------
 function normalizePhone(raw: string) {
   return String(raw || "").replace(/[^\d]/g, "");
-}
-
-function toISODateOnly(d: Date) {
-  // YYYY-MM-DD en hora local (server). Para comparar strings.
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
 }
 
 function clamp(n: number, min: number, max: number) {
@@ -33,7 +25,6 @@ function safeToNumber(v: any, fallback = 0) {
 }
 
 function escapeICS(text: string) {
-  // RFC5545 basic escaping
   return String(text ?? "")
     .replace(/\\/g, "\\\\")
     .replace(/\n/g, "\\n")
@@ -41,7 +32,6 @@ function escapeICS(text: string) {
     .replace(/;/g, "\\;");
 }
 
-// --- HELPER: GENERADOR DE ICS ---
 function generateICSContent(
   id: string,
   title: string,
@@ -50,10 +40,7 @@ function generateICSContent(
   endISO: string
 ) {
   const formatDateICS = (d: Date) =>
-    d
-      .toISOString()
-      .replace(/[-:]/g, "")
-      .split(".")[0] + "Z";
+    d.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
 
   const now = new Date();
   const start = new Date(startISO);
@@ -82,15 +69,78 @@ function generateICSContent(
   ].join("\r\n");
 }
 
-// --- TOOLS ---
+// -----------------------------
+// JSON Schemas (evita "type None")
+// -----------------------------
+const S = {
+  checkAvailability: {
+    type: "object",
+    additionalProperties: false,
+    required: ["tenantId", "requestedDate"],
+    properties: {
+      tenantId: { type: "string" },
+      requestedDate: { type: "string", description: "Fecha YYYY-MM-DD" },
+    },
+  },
+  getServices: {
+    type: "object",
+    additionalProperties: false,
+    required: ["tenantId"],
+    properties: {
+      tenantId: { type: "string" },
+    },
+  },
+  createBooking: {
+    type: "object",
+    additionalProperties: false,
+    required: ["tenantId", "customerPhone", "startsAtISO"],
+    properties: {
+      tenantId: { type: "string" },
+      customerPhone: { type: "string" },
+      customerName: { type: "string" },
+      serviceId: { anyOf: [{ type: "string" }, { type: "null" }] },
+      startsAtISO: { type: "string", description: "Fecha inicio ISO 8601" },
+      endsAtISO: { type: "string" },
+      notes: { type: "string" },
+    },
+  },
+  rescheduleBooking: {
+    type: "object",
+    additionalProperties: false,
+    required: ["tenantId", "customerPhone", "newStartsAtISO"],
+    properties: {
+      tenantId: { type: "string" },
+      customerPhone: { type: "string" },
+      newStartsAtISO: { type: "string", description: "Nueva fecha inicio ISO 8601" },
+    },
+  },
+  getMyBookings: {
+    type: "object",
+    additionalProperties: false,
+    required: ["tenantId", "customerPhone"],
+    properties: {
+      tenantId: { type: "string" },
+      customerPhone: { type: "string" },
+    },
+  },
+  cancelBooking: {
+    type: "object",
+    additionalProperties: false,
+    required: ["tenantId", "customerPhone"],
+    properties: {
+      tenantId: { type: "string" },
+      customerPhone: { type: "string" },
+    },
+  },
+} as const;
 
-// 1. DISPONIBILIDAD
+// -----------------------------
+// Tools
+// -----------------------------
+
 export const checkAvailabilityTool = tool({
   description: "Consulta horarios disponibles.",
-  parameters: z.object({
-    tenantId: z.string(),
-    requestedDate: z.string().describe("Fecha YYYY-MM-DD"),
-  }),
+  parameters: S.checkAvailability as any,
   execute: async (input: any) => {
     const tenantId = String(input?.tenantId || "").trim();
     const requestedDate = String(input?.requestedDate || "").trim();
@@ -100,7 +150,6 @@ export const checkAvailabilityTool = tool({
         return { available: false, message: "Faltan datos (tenantId, requestedDate)." };
       }
 
-      // Parse robusto de YYYY-MM-DD evitando timezone raros
       const parts = requestedDate.split("-");
       if (parts.length !== 3) return { available: false, message: "requestedDate inválida. Usa YYYY-MM-DD." };
 
@@ -109,7 +158,7 @@ export const checkAvailabilityTool = tool({
       const d = safeToNumber(parts[2], 0);
       if (!y || !m || !d) return { available: false, message: "requestedDate inválida. Usa YYYY-MM-DD." };
 
-      const date = new Date(y, m - 1, d, 12, 0, 0, 0); // noon para evitar DST edge
+      const date = new Date(y, m - 1, d, 12, 0, 0, 0);
       const dayOfWeek = date.getDay();
 
       const { data: hours, error: hoursErr } = await supabase
@@ -119,13 +168,9 @@ export const checkAvailabilityTool = tool({
         .eq("dow", dayOfWeek)
         .maybeSingle();
 
-      if (hoursErr) {
-        return { available: false, message: "Error leyendo business_hours: " + hoursErr.message };
-      }
-
+      if (hoursErr) return { available: false, message: "Error leyendo business_hours: " + hoursErr.message };
       if (!hours || hours.is_closed) return { available: false, message: "Cerrado ese día." };
 
-      // Ventana del día
       const startOfDay = new Date(y, m - 1, d, 0, 0, 0, 0);
       const endOfDay = new Date(y, m - 1, d, 23, 59, 59, 999);
 
@@ -137,9 +182,7 @@ export const checkAvailabilityTool = tool({
         .gte("starts_at", startOfDay.toISOString())
         .lte("ends_at", endOfDay.toISOString());
 
-      if (bookingsErr) {
-        return { available: false, message: "Error leyendo bookings: " + bookingsErr.message };
-      }
+      if (bookingsErr) return { available: false, message: "Error leyendo bookings: " + bookingsErr.message };
 
       const slots: any[] = [];
       const [openH, openM] = String(hours.open_time).split(":").map((n: string) => safeToNumber(n, 0));
@@ -148,10 +191,8 @@ export const checkAvailabilityTool = tool({
       let cursor = new Date(y, m - 1, d, openH, openM, 0, 0);
       const closeTime = new Date(y, m - 1, d, closeH, closeM, 0, 0);
 
-      // Sanidad
       if (!(cursor < closeTime)) return { available: false, message: "Horario inválido en business_hours." };
 
-      // Slots: 30 min step, 60 min duration
       while (cursor < closeTime) {
         const slotEnd = new Date(cursor.getTime() + 60 * 60000);
 
@@ -163,11 +204,7 @@ export const checkAvailabilityTool = tool({
 
         if (!isBusy) {
           slots.push({
-            label: cursor.toLocaleTimeString("es-DO", {
-              hour: "2-digit",
-              minute: "2-digit",
-              hour12: true,
-            }),
+            label: cursor.toLocaleTimeString("es-DO", { hour: "2-digit", minute: "2-digit", hour12: true }),
             iso: cursor.toISOString(),
           });
         }
@@ -182,12 +219,9 @@ export const checkAvailabilityTool = tool({
   },
 } as any);
 
-// 2. BUSCAR SERVICIOS
 export const getServicesTool = tool({
   description: "Busca servicios y precios.",
-  parameters: z.object({
-    tenantId: z.string(),
-  }),
+  parameters: S.getServices as any,
   execute: async (input: any) => {
     const tenantId = String(input?.tenantId || "").trim();
     try {
@@ -217,18 +251,9 @@ export const getServicesTool = tool({
   },
 } as any);
 
-// 3. AGENDAR (CON ICS)
 export const createBookingTool = tool({
   description: "Crea una nueva cita.",
-  parameters: z.object({
-    tenantId: z.string(),
-    customerPhone: z.string(),
-    customerName: z.string().optional(),
-    serviceId: z.string().optional().nullable(),
-    startsAtISO: z.string().describe("Fecha inicio ISO 8601"),
-    endsAtISO: z.string().optional(),
-    notes: z.string().optional(),
-  }),
+  parameters: S.createBooking as any,
   execute: async (input: any) => {
     const tenantId = String(input?.tenantId || "").trim();
     const customerPhone = normalizePhone(input?.customerPhone);
@@ -243,21 +268,15 @@ export const createBookingTool = tool({
     }
 
     const start = new Date(startsAtISO);
-    if (Number.isNaN(start.getTime())) {
-      return { success: false, message: "startsAtISO inválido.", icsData: "" };
-    }
+    if (Number.isNaN(start.getTime())) return { success: false, message: "startsAtISO inválido.", icsData: "" };
 
     const end = endsAtISO ? new Date(endsAtISO) : new Date(start.getTime() + 60 * 60000);
-    if (Number.isNaN(end.getTime())) {
-      return { success: false, message: "endsAtISO inválido.", icsData: "" };
-    }
+    if (Number.isNaN(end.getTime())) return { success: false, message: "endsAtISO inválido.", icsData: "" };
 
-    // Asegurar mínimo 15 min y máximo 4h
     const durMin = clamp(Math.round((end.getTime() - start.getTime()) / 60000), 15, 240);
     const safeEnd = new Date(start.getTime() + durMin * 60000);
 
     try {
-      // Evitar doble booking exacto (mismo phone + mismo starts_at)
       const { data: existing } = await supabase
         .from("bookings")
         .select("id")
@@ -267,13 +286,7 @@ export const createBookingTool = tool({
         .maybeSingle();
 
       if (existing?.id) {
-        const ics = generateICSContent(
-          existing.id,
-          "Cita Confirmada",
-          `Reserva en ${tenantId}`,
-          start.toISOString(),
-          safeEnd.toISOString()
-        );
+        const ics = generateICSContent(existing.id, "Cita Confirmada", `Reserva en ${tenantId}`, start.toISOString(), safeEnd.toISOString());
         return { success: true, message: "✅ Ya existía una cita a esa hora. Te la confirmo.", icsData: ics, bookingId: existing.id };
       }
 
@@ -294,14 +307,7 @@ export const createBookingTool = tool({
 
       if (error) throw error;
 
-      const ics = generateICSContent(
-        data.id,
-        "Cita Confirmada",
-        `Reserva en ${tenantId}`,
-        data.starts_at,
-        data.ends_at
-      );
-
+      const ics = generateICSContent(data.id, "Cita Confirmada", `Reserva en ${tenantId}`, data.starts_at, data.ends_at);
       return { success: true, message: "✅ Cita confirmada.", icsData: ics, bookingId: data.id };
     } catch (e: any) {
       return { success: false, message: "Error al guardar: " + (e?.message || "unknown"), icsData: "" };
@@ -309,14 +315,9 @@ export const createBookingTool = tool({
   },
 } as any);
 
-// 4. REAGENDAR (CON ICS)
 export const rescheduleBookingTool = tool({
   description: "Reagenda una cita existente.",
-  parameters: z.object({
-    tenantId: z.string(),
-    customerPhone: z.string(),
-    newStartsAtISO: z.string().describe("Nueva fecha inicio ISO 8601"),
-  }),
+  parameters: S.rescheduleBooking as any,
   execute: async (input: any) => {
     const tenantId = String(input?.tenantId || "").trim();
     const customerPhone = normalizePhone(input?.customerPhone);
@@ -327,9 +328,7 @@ export const rescheduleBookingTool = tool({
     }
 
     const start = new Date(newStartsAtISO);
-    if (Number.isNaN(start.getTime())) {
-      return { success: false, message: "newStartsAtISO inválido.", icsData: "" };
-    }
+    if (Number.isNaN(start.getTime())) return { success: false, message: "newStartsAtISO inválido.", icsData: "" };
 
     const end = new Date(start.getTime() + 60 * 60000);
 
@@ -349,23 +348,12 @@ export const rescheduleBookingTool = tool({
 
       const { error } = await supabase
         .from("bookings")
-        .update({
-          starts_at: start.toISOString(),
-          ends_at: end.toISOString(),
-          status: "confirmed",
-        })
+        .update({ starts_at: start.toISOString(), ends_at: end.toISOString(), status: "confirmed" })
         .eq("id", booking.id);
 
       if (error) throw error;
 
-      const ics = generateICSContent(
-        booking.id,
-        "Cita Reagendada",
-        "Tu cita ha sido movida.",
-        start.toISOString(),
-        end.toISOString()
-      );
-
+      const ics = generateICSContent(booking.id, "Cita Reagendada", "Tu cita ha sido movida.", start.toISOString(), end.toISOString());
       return { success: true, message: "✅ Cita reagendada.", icsData: ics, bookingId: booking.id };
     } catch (e: any) {
       return { success: false, message: "Error al reagendar: " + (e?.message || "unknown"), icsData: "" };
@@ -373,17 +361,12 @@ export const rescheduleBookingTool = tool({
   },
 } as any);
 
-// 5. MIS CITAS
 export const getMyBookingsTool = tool({
   description: "Busca citas futuras.",
-  parameters: z.object({
-    tenantId: z.string(),
-    customerPhone: z.string(),
-  }),
+  parameters: S.getMyBookings as any,
   execute: async (input: any) => {
     const tenantId = String(input?.tenantId || "").trim();
     const customerPhone = normalizePhone(input?.customerPhone);
-
     if (!tenantId || !customerPhone) return { found: false, bookings: [] };
 
     const { data, error } = await supabase
@@ -397,22 +380,16 @@ export const getMyBookingsTool = tool({
       .limit(10);
 
     if (error) return { found: false, bookings: [], error: error.message };
-
     return { found: !!data?.length, bookings: data || [] };
   },
 } as any);
 
-// 6. CANCELAR
 export const cancelBookingTool = tool({
   description: "Cancela cita.",
-  parameters: z.object({
-    tenantId: z.string(),
-    customerPhone: z.string(),
-  }),
+  parameters: S.cancelBooking as any,
   execute: async (input: any) => {
     const tenantId = String(input?.tenantId || "").trim();
     const customerPhone = normalizePhone(input?.customerPhone);
-
     if (!tenantId || !customerPhone) return { success: false, message: "Faltan datos (tenantId, customerPhone)." };
 
     try {
