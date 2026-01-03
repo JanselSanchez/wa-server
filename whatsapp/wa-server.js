@@ -7,6 +7,10 @@
  * ✅ Alias: POST /sessions/:tenantId/send-message
  * ✅ Persistencia auth por filesystem (Render Persistent Disk recomendado)
  * ✅ Respuestas consistentes: connected | qrcode_required | wa_not_connected
+ *
+ * 🛠️ CORRECCIONES APLICADAS:
+ * 1. restoreSessions: Solo revive 'connected' para evitar spam de QRs en logs.
+ * 2. /connect: Fuerza limpieza de sesión previa para garantizar QR fresco.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -250,13 +254,13 @@ function createICSFile(title, description, location, startDate, durationMinutes 
     "CALSCALE:GREGORIAN",
     "METHOD:PUBLISH",
     "BEGIN:VEVENT",
-    `UID:${now.getTime()}@pymebot.com`,
-    `DTSTAMP:${formatTime(now)}`,
-    `DTSTART:${formatTime(start)}`,
-    `DTEND:${formatTime(end)}`,
-    `SUMMARY:${title}`,
-    `DESCRIPTION:${description}`,
-    `LOCATION:${location}`,
+    "UID:" + now.getTime() + "@pymebot.com",
+    "DTSTAMP:" + formatTime(now),
+    "DTSTART:" + formatTime(start),
+    "DTEND:" + formatTime(end),
+    "SUMMARY:" + title,
+    "DESCRIPTION:" + description,
+    "LOCATION:" + location,
     "STATUS:CONFIRMED",
     "BEGIN:VALARM",
     "TRIGGER:-PT30M",
@@ -393,7 +397,7 @@ async function getAvailableSlots(tenantId, resourceId, startDate, daysToLookAhea
 }
 
 // ---------------------------------------------------------------------
-// 4. INTENT_KEYWORDS ENGINE (tu lógica intacta)
+// 4. INTENT_KEYWORDS ENGINE
 // ---------------------------------------------------------------------
 
 function normalizeForIntent(str = "") {
@@ -460,7 +464,7 @@ async function buildIntentHints(tenantId, userText) {
 }
 
 // ---------------------------------------------------------------------
-// 5. TOOLS OpenAI (tu lógica intacta)
+// 5. TOOLS OpenAI
 // ---------------------------------------------------------------------
 
 const tools = [
@@ -528,7 +532,7 @@ const tools = [
 ];
 
 // ---------------------------------------------------------------------
-// 6. IA (tu lógica intacta)
+// 6. IA
 // ---------------------------------------------------------------------
 
 async function generateReply(text, tenantId, pushName, historyMessages = [], userPhone = null) {
@@ -821,7 +825,7 @@ async function updateSessionDB(tenantId, updateData) {
 }
 
 // ---------------------------------------------------------------------
-// 8. customers + eventos booking (tu lógica intacta)
+// 8. customers + eventos booking
 // ---------------------------------------------------------------------
 
 async function getOrCreateCustomer(tenantId, phoneNumber) {
@@ -1190,10 +1194,20 @@ app.get("/sessions/:tenantId", async (req, res) => {
   });
 });
 
+// 🔥 CORRECCIÓN 2: Fuerza limpieza para evitar QR viejo
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
   try {
+    // 1. Matar sesión vieja si existe y está trabada
+    const existing = sessions.get(tenantId);
+    if (existing && existing.status !== "connected") {
+      try { await existing.socket.logout(); } catch(e) {}
+      sessions.delete(tenantId);
+    }
+
+    // 2. Crear nueva fresca
     const info = await getOrCreateSession(tenantId);
+    
     // espera un poco por si conecta rápido
     const s = await waitForConnected(tenantId, 2500);
     return res.json({
@@ -1455,7 +1469,8 @@ async function restoreSessions() {
     const { data, error } = await supabase
       .from("whatsapp_sessions")
       .select("tenant_id, status")
-      .in("status", ["connected", "qrcode", "connecting"]);
+      // 🔥 CORRECCIÓN 1: Solo revivir 'connected'. Ignorar QRs viejos.
+      .eq("status", "connected");
 
     if (error) {
       logger.error(error, "restoreSessions: DB error");
