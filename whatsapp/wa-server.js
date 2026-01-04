@@ -1,16 +1,23 @@
 /**
  * wa-server.js — versión producción (lista para vender)
  *
- * ✅ Estado real: /sessions/:tenantId (memoria + DB fallback)
- * ✅ Connect: /sessions/:tenantId/connect
- * ✅ Send (n8n): POST /sessions/:tenantId/messages  (Bearer opcional)
- * ✅ Alias: POST /sessions/:tenantId/send-message
+ * ✅ Multi-tenant real
+ * ✅ NO QR spam (throttle + anti-loop + /connect seguro)
+ * ✅ Reconexión robusta (backoff)
+ * ✅ Solo pide QR cuando es logout real
  * ✅ Persistencia auth por filesystem (Render Persistent Disk recomendado)
- * ✅ Respuestas consistentes: connected | qrcode_required | wa_not_connected
+ * ✅ DB sync: whatsapp_sessions + tenants.wa_connected
  *
- * 🛠️ CORRECCIONES APLICADAS:
- * 1. restoreSessions: Solo revive 'connected' para evitar spam de QRs en logs.
- * 2. /connect: Fuerza limpieza de sesión previa para garantizar QR fresco.
+ * Endpoints:
+ * - GET  /health
+ * - GET  /sessions/:tenantId
+ * - POST /sessions/:tenantId/connect
+ * - POST /sessions/:tenantId/disconnect
+ * - POST /sessions/:tenantId/messages   (Bearer opcional)
+ * - POST /sessions/:tenantId/send-message (alias)
+ * - POST /sessions/:tenantId/send-template
+ * - POST /sessions/:tenantId/send-media
+ * - GET  /api/v1/availability
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -35,8 +42,6 @@ const convoState = require("./conversationState");
 // CONFIGURACIÓN GLOBAL
 // ---------------------------------------------------------------------
 
-// ⚠️ En producción NO deberías desactivar TLS.
-// Si tienes un caso puntual (certs raros), habilítalo explícitamente.
 if (String(process.env.ALLOW_INSECURE_TLS || "").trim() === "1") {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
   console.warn(
@@ -86,7 +91,20 @@ if (!openaiApiKey) {
 const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 
 /**
- * sessions: Map<tenantId, { tenantId, socket, status, qr, conversations: Map<phone, { history: [] }> }>
+ * sessions: Map<tenantId, info>
+ * info: {
+ *   tenantId,
+ *   socket,
+ *   status: 'idle'|'connecting'|'connected'|'qrcode'|'disconnected',
+ *   qr,
+ *   conversations: Map<phone, {history: []}>,
+ *   createdAt,
+ *   lastConnectedAt,
+ *   lastQrAt,
+ *   reconnectAttempts,
+ *   nextReconnectAt,
+ *   connectingPromise
+ * }
  */
 const sessions = new Map();
 
@@ -153,13 +171,15 @@ async function waitForConnected(tenantId, timeoutMs = 12000) {
   while (Date.now() - start < timeoutMs) {
     const s = sessions.get(tenantId);
     if (s?.status === "connected" && s?.socket) return s;
+    // Si está en QR, no esperes más
+    if (s?.status === "qrcode") return s;
     await sleep(350);
   }
   return sessions.get(tenantId) || null;
 }
 
 // ---------------------------------------------------------------------
-// 1. LÓGICA DE SCHEDULING
+// 1. LÓGICA DE SCHEDULING (TU CÓDIGO intacto)
 // ---------------------------------------------------------------------
 
 function hmsToParts(hms) {
@@ -236,7 +256,7 @@ function generateOfferableSlots(openWindows, bookings, stepMin = 30) {
 }
 
 // ---------------------------------------------------------------------
-// 2. HELPERS: ICS
+// 2. HELPERS: ICS (TU CÓDIGO intacto)
 // ---------------------------------------------------------------------
 
 function createICSFile(title, description, location, startDate, durationMinutes = 60) {
@@ -330,7 +350,7 @@ async function sendICS(sock, remoteJid, icsData, opts = {}) {
 }
 
 // ---------------------------------------------------------------------
-// 3. DB HELPERS
+// 3. DB HELPERS (TU CÓDIGO intacto)
 // ---------------------------------------------------------------------
 
 async function getTenantContext(tenantId) {
@@ -397,7 +417,7 @@ async function getAvailableSlots(tenantId, resourceId, startDate, daysToLookAhea
 }
 
 // ---------------------------------------------------------------------
-// 4. INTENT_KEYWORDS ENGINE
+// 4. INTENT_KEYWORDS ENGINE (TU CÓDIGO intacto)
 // ---------------------------------------------------------------------
 
 function normalizeForIntent(str = "") {
@@ -464,7 +484,7 @@ async function buildIntentHints(tenantId, userText) {
 }
 
 // ---------------------------------------------------------------------
-// 5. TOOLS OpenAI
+// 5. TOOLS OpenAI (TU CÓDIGO intacto)
 // ---------------------------------------------------------------------
 
 const tools = [
@@ -532,7 +552,7 @@ const tools = [
 ];
 
 // ---------------------------------------------------------------------
-// 6. IA
+// 6. IA (TU CÓDIGO intacto)
 // ---------------------------------------------------------------------
 
 async function generateReply(text, tenantId, pushName, historyMessages = [], userPhone = null) {
@@ -825,7 +845,7 @@ async function updateSessionDB(tenantId, updateData) {
 }
 
 // ---------------------------------------------------------------------
-// 8. customers + eventos booking
+// 8. customers + eventos booking (TU CÓDIGO intacto)
 // ---------------------------------------------------------------------
 
 async function getOrCreateCustomer(tenantId, phoneNumber) {
@@ -909,230 +929,375 @@ async function useFileAuthState(tenantId) {
   if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-  return { state, saveCreds };
+  return { state, saveCreds, sessionFolder };
 }
 
 // ---------------------------------------------------------------------
-// 10. CORE WHATSAPP (Baileys + n8n)
+// 10. CORE WHATSAPP (Baileys + n8n) — CORREGIDO ANTI-QR SPAM
 // ---------------------------------------------------------------------
 
+const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 15000); // no más de 1 QR cada 15s por tenant
+const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 2000);
+const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 60000);
+const CONNECT_CREATE_TIMEOUT_MS = Number(process.env.CONNECT_CREATE_TIMEOUT_MS || 15000);
+
+// flags para no tumbar proceso
+process.on("unhandledRejection", (reason) => {
+  console.error("[wa-server] unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[wa-server] uncaughtException:", err);
+});
+
+function computeBackoffMs(attempts) {
+  const raw = RECONNECT_BASE_MS * Math.pow(2, Math.min(attempts, 6)); // 2s,4,8,16,32,64
+  const jitter = Math.floor(Math.random() * 500);
+  return Math.min(raw + jitter, RECONNECT_MAX_MS);
+}
+
+async function safeCloseSocket(sock) {
+  if (!sock) return;
+  try {
+    // end() es menos agresivo que logout()
+    sock.end?.();
+  } catch {}
+}
+
+async function maybeDeleteAuthFolder(sessionFolder) {
+  // Solo usar cuando logout real; en ese caso necesitas QR nuevo.
+  try {
+    if (sessionFolder && fs.existsSync(sessionFolder)) {
+      fs.rmSync(sessionFolder, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.error("[wa-server] No pude borrar auth folder:", e?.message || e);
+  }
+}
+
+/**
+ * getOrCreateSession
+ * - NO crea 2 sockets por tenant (lock via connectingPromise)
+ * - NO hace logout agresivo
+ * - Reconecta con backoff
+ * - QR throttle
+ */
 async function getOrCreateSession(tenantId) {
-  const existing = sessions.get(tenantId);
-  if (existing && existing.socket) return existing;
+  const current = sessions.get(tenantId);
 
-  logger.info({ tenantId }, "🔌 Iniciando Socket...");
+  // Si ya está conectado, listo
+  if (current?.socket && current.status === "connected") return current;
 
-  const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
-  const { state, saveCreds } = await useFileAuthState(tenantId);
+  // Si está conectando, espera el mismo promise
+  if (current?.connectingPromise) {
+    return await current.connectingPromise;
+  }
 
-  const sock = makeWASocket({
-    auth: state,
-    logger,
-    printQRInTerminal: false,
-    browser: ["PymeBot", "Chrome", "1.0.0"],
-    syncFullHistory: false,
-    connectTimeoutMs: 60000,
-  });
-
-  const info = {
+  // Crea estructura base si no existe
+  const info = current || {
     tenantId,
-    socket: sock,
-    status: "connecting",
+    socket: null,
+    status: "idle",
     qr: null,
     conversations: new Map(),
+    createdAt: new Date().toISOString(),
+    lastConnectedAt: null,
+    lastQrAt: null,
+    reconnectAttempts: 0,
+    nextReconnectAt: null,
+    connectingPromise: null,
   };
+
   sessions.set(tenantId, info);
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, qr, lastDisconnect } = update;
+  // Promise lock para evitar doble instancia por tenant
+  info.connectingPromise = (async () => {
+    logger.info({ tenantId }, "🔌 Creando socket...");
 
-    if (qr) {
-      info.status = "qrcode";
-      info.qr = qr;
+    const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
+    const { state, saveCreds, sessionFolder } = await useFileAuthState(tenantId);
 
-      logger.info({ tenantId }, "✨ QR Generado");
-      await updateSessionDB(tenantId, {
-        qr_data: qr,
-        status: "qrcode",
-        last_seen_at: new Date().toISOString(),
-      });
-
-      // (solo para debug en logs)
-      qrcode.generate(qr, { small: true });
+    // Cierra socket previo si existe
+    if (info.socket) {
+      await safeCloseSocket(info.socket);
+      info.socket = null;
     }
 
-    if (connection === "open") {
-      info.status = "connected";
-      info.qr = null;
+    info.status = "connecting";
+    info.qr = null;
 
-      const phone = sock?.user?.id ? sock.user.id.split(":")[0] : null;
-      logger.info({ tenantId, phone }, "✅ Conectado");
+    await updateSessionDB(tenantId, {
+      status: "connecting",
+      last_seen_at: new Date().toISOString(),
+    });
 
-      await updateSessionDB(tenantId, {
-        status: "connected",
-        qr_data: null,
-        phone_number: phone,
-        last_connected_at: new Date().toISOString(),
-        last_seen_at: new Date().toISOString(),
-      });
-    }
+    const sock = makeWASocket({
+      auth: state,
+      logger,
+      printQRInTerminal: false,
+      browser: ["PymeBot", "Chrome", "1.0.0"],
+      syncFullHistory: false,
+      connectTimeoutMs: 60000,
+      // 🔥 IMPORTANT: evita loops por queries
+      // markOnlineOnConnect: false,
+    });
 
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
+    info.socket = sock;
 
-      logger.warn({ tenantId, code, shouldReconnect }, "⚠️ connection.close");
+    // ---- connection.update
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, qr, lastDisconnect } = update;
 
-      if (shouldReconnect) {
-        sessions.delete(tenantId);
+      // QR throttle para evitar spam
+      if (qr) {
+        const now = Date.now();
+        const last = info.lastQrAt ? new Date(info.lastQrAt).getTime() : 0;
+        if (now - last >= QR_THROTTLE_MS) {
+          info.status = "qrcode";
+          info.qr = qr;
+          info.lastQrAt = new Date().toISOString();
+
+          logger.info({ tenantId }, "✨ QR Generado (throttled ok)");
+          await updateSessionDB(tenantId, {
+            qr_data: qr,
+            status: "qrcode",
+            last_seen_at: new Date().toISOString(),
+          });
+
+          // debug
+          if (String(process.env.PRINT_QR_LOGS || "").trim() === "1") {
+            qrcode.generate(qr, { small: true });
+          }
+        } else {
+          logger.warn(
+            { tenantId },
+            "⚠️ QR recibido pero ignorado por throttle (evita spam/loops)"
+          );
+        }
+      }
+
+      if (connection === "open") {
+        info.status = "connected";
+        info.qr = null;
+        info.reconnectAttempts = 0;
+        info.nextReconnectAt = null;
+        info.lastConnectedAt = new Date().toISOString();
+
+        const phone = sock?.user?.id ? sock.user.id.split(":")[0] : null;
+        logger.info({ tenantId, phone }, "✅ Conectado");
+
         await updateSessionDB(tenantId, {
-          status: "connecting",
+          status: "connected",
+          qr_data: null,
+          phone_number: phone,
+          last_connected_at: new Date().toISOString(),
           last_seen_at: new Date().toISOString(),
         });
-        // reconecta
-        getOrCreateSession(tenantId).catch(() => {});
-      } else {
-        sessions.delete(tenantId);
-        await updateSessionDB(tenantId, { status: "disconnected", qr_data: null });
-        logger.info({ tenantId }, "❌ Logout detectado: requiere QR.");
       }
-    }
-  });
 
-  // IMPORTANTE: guardar credenciales actualizadas
-  sock.ev.on("creds.update", async () => {
-    try {
-      await saveCreds();
-      await updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() });
-    } catch (e) {
-      logger.error(e, "[creds.update] saveCreds failed");
-    }
-  });
+      if (connection === "close") {
+        const code = lastDisconnect?.error?.output?.statusCode;
 
-  // Mensajes entrantes
-  sock.ev.on("messages.upsert", async (m) => {
-    try {
-      const msg = m.messages?.[0];
-      if (!msg) return;
-      if (!msg?.message || msg.key.fromMe) return;
+        // Default: reconectar, excepto logout real
+        const isLoggedOut = code === DisconnectReason.loggedOut;
 
-      const remoteJid = msg.key.remoteJid;
-      if (!remoteJid || remoteJid.includes("@g.us")) return;
+        logger.warn({ tenantId, code, isLoggedOut }, "⚠️ connection.close");
 
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
+        info.socket = null;
 
-      if (!text) return;
+        if (isLoggedOut) {
+          // logout real => borrar auth folder para forzar QR nuevo limpio
+          info.status = "disconnected";
+          info.qr = null;
 
-      const pushName = msg.pushName || "Cliente";
-      const userPhone = remoteJid.split("@")[0];
+          await maybeDeleteAuthFolder(sessionFolder);
 
-      let convo = info.conversations.get(userPhone);
-      if (!convo) {
-        convo = { history: [] };
-        info.conversations.set(userPhone, convo);
+          await updateSessionDB(tenantId, {
+            status: "disconnected",
+            qr_data: null,
+            last_seen_at: new Date().toISOString(),
+          });
+
+          logger.info({ tenantId }, "❌ Logout real: requiere QR nuevo.");
+          return;
+        }
+
+        // Caída normal => reconectar con backoff
+        info.status = "connecting";
+        info.qr = null;
+        info.reconnectAttempts = (info.reconnectAttempts || 0) + 1;
+
+        const waitMs = computeBackoffMs(info.reconnectAttempts);
+        info.nextReconnectAt = new Date(Date.now() + waitMs).toISOString();
+
+        await updateSessionDB(tenantId, {
+          status: "connecting",
+          qr_data: null,
+          last_seen_at: new Date().toISOString(),
+        });
+
+        logger.info({ tenantId, waitMs }, "♻️ Reconnect scheduled");
+
+        setTimeout(() => {
+          // si mientras tanto alguien conectó, no hagas nada
+          const s = sessions.get(tenantId);
+          if (s?.status === "connected") return;
+          // dispara reconexión
+          getOrCreateSession(tenantId).catch((e) =>
+            logger.error({ tenantId, e }, "Reconnect failed")
+          );
+        }, waitMs);
       }
-      const history = convo.history || [];
+    });
 
-      const convoSession = await convoState.getOrCreateSession(tenantId, userPhone);
-      const customerId = await getOrCreateCustomer(tenantId, userPhone);
-      const event = buildBookingEventFromMessage(text, convoSession);
+    // ---- creds.update (persistir)
+    sock.ev.on("creds.update", async () => {
+      try {
+        await saveCreds();
+        await updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() });
+      } catch (e) {
+        logger.error(e, "[creds.update] saveCreds failed");
+      }
+    });
 
-      const botApiUrl = process.env.N8N_WEBHOOK_URL;
+    // ---- mensajes entrantes (TU CÓDIGO intacto, pero usando info.socket que existe)
+    sock.ev.on("messages.upsert", async (m) => {
+      try {
+        const msg = m.messages?.[0];
+        if (!msg) return;
+        if (!msg?.message || msg.key.fromMe) return;
 
-      let replyText = null;
-      let newState = null;
-      let icsData = null;
+        const remoteJid = msg.key.remoteJid;
+        if (!remoteJid || remoteJid.includes("@g.us")) return;
 
-      if (botApiUrl) {
-        const payload = {
-          tenantId,
-          customerId,
-          phoneNumber: userPhone,
-          text,
-          customerName: pushName,
-          state: {
+        const text =
+          msg.message.conversation ||
+          msg.message.extendedTextMessage?.text ||
+          msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
+
+        if (!text) return;
+
+        const pushName = msg.pushName || "Cliente";
+        const userPhone = remoteJid.split("@")[0];
+
+        let convo = info.conversations.get(userPhone);
+        if (!convo) {
+          convo = { history: [] };
+          info.conversations.set(userPhone, convo);
+        }
+        const history = convo.history || [];
+
+        const convoSession = await convoState.getOrCreateSession(tenantId, userPhone);
+        const customerId = await getOrCreateCustomer(tenantId, userPhone);
+        const event = buildBookingEventFromMessage(text, convoSession);
+
+        const botApiUrl = process.env.N8N_WEBHOOK_URL;
+
+        let replyText = null;
+        let newState = null;
+        let icsData = null;
+
+        if (botApiUrl) {
+          const payload = {
+            tenantId,
+            customerId,
+            phoneNumber: userPhone,
+            text,
+            customerName: pushName,
+            state: {
+              current_flow: convoSession.current_flow,
+              step: convoSession.step,
+              payload: convoSession.payload || {},
+            },
+            event,
+          };
+
+          try {
+            const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
+            const d = response?.data || null;
+
+            if (d) {
+              if (typeof d.data === "string") replyText = d.data;
+              if (!replyText && typeof d.replyText === "string") replyText = d.replyText;
+              if (!replyText && typeof d.message === "string") replyText = d.message;
+              if (!replyText && typeof d.reply === "string") replyText = d.reply;
+
+              if (d.newState) newState = d.newState;
+              if (d.icsData) icsData = d.icsData;
+            }
+          } catch (err) {
+            logger.error("[wa-server] Error n8n:", err?.response?.data || err.message);
+          }
+        } else {
+          logger.error("[wa-server] N8N_WEBHOOK_URL no está configurado.");
+        }
+
+        if (!replyText) {
+          const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
+          replyText =
+            fallback ||
+            "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
+
+          newState = {
             current_flow: convoSession.current_flow,
             step: convoSession.step,
             payload: convoSession.payload || {},
-          },
-          event,
-        };
+          };
+        }
 
-        try {
-          const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
-          const d = response?.data || null;
-
-          if (d) {
-            if (typeof d.data === "string") replyText = d.data;
-            if (!replyText && typeof d.replyText === "string") replyText = d.replyText;
-            if (!replyText && typeof d.message === "string") replyText = d.message;
-            if (!replyText && typeof d.reply === "string") replyText = d.reply;
-
-            if (d.newState) newState = d.newState;
-            if (d.icsData) icsData = d.icsData;
+        if (newState) {
+          try {
+            await convoState.updateSession(convoSession.id, {
+              current_flow: newState.current_flow,
+              step: newState.step,
+              payload: newState.payload,
+            });
+          } catch (err) {
+            logger.error("[wa-server] Error actualizando conversación:", err);
           }
-        } catch (err) {
-          logger.error("[wa-server] Error n8n:", err?.response?.data || err.message);
         }
-      } else {
-        logger.error("[wa-server] N8N_WEBHOOK_URL no está configurado.");
-      }
 
-      if (!replyText) {
-        const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
-        replyText =
-          fallback ||
-          "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
+        await sock.sendMessage(remoteJid, { text: replyText });
 
-        newState = {
-          current_flow: convoSession.current_flow,
-          step: convoSession.step,
-          payload: convoSession.payload || {},
-        };
-      }
-
-      if (newState) {
-        try {
-          await convoState.updateSession(convoSession.id, {
-            current_flow: newState.current_flow,
-            step: newState.step,
-            payload: newState.payload,
+        if (icsData) {
+          const ok = await sendICS(sock, remoteJid, icsData, {
+            fileName: "cita_confirmada.ics",
+            caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
           });
-        } catch (err) {
-          logger.error("[wa-server] Error actualizando conversación:", err);
+          if (!ok) logger.warn({ tenantId }, "⚠️ icsData inválido (texto/base64).");
         }
+
+        history.push({ role: "user", content: text });
+        history.push({ role: "assistant", content: replyText });
+
+        const MAX_MESSAGES = 20;
+        if (history.length > MAX_MESSAGES) history.splice(0, history.length - MAX_MESSAGES);
+
+        convo.history = history;
+        info.conversations.set(userPhone, convo);
+
+        updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() }).catch(() => {});
+      } catch (e) {
+        logger.error("[wa-server] Error en messages.upsert:", e);
       }
+    });
 
-      await sock.sendMessage(remoteJid, { text: replyText });
+    return info;
+  })();
 
-      if (icsData) {
-        const ok = await sendICS(sock, remoteJid, icsData, {
-          fileName: "cita_confirmada.ics",
-          caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
-        });
-        if (!ok) logger.warn({ tenantId }, "⚠️ icsData inválido (texto/base64).");
-      }
-
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: replyText });
-
-      const MAX_MESSAGES = 20;
-      if (history.length > MAX_MESSAGES) history.splice(0, history.length - MAX_MESSAGES);
-
-      convo.history = history;
-      info.conversations.set(userPhone, convo);
-
-      // heartbeat DB (evita “sesión fantasma”)
-      updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() }).catch(() => {});
-    } catch (e) {
-      logger.error("[wa-server] Error en messages.upsert:", e);
-    }
-  });
-
-  return info;
+  try {
+    const out = await Promise.race([
+      info.connectingPromise,
+      (async () => {
+        await sleep(CONNECT_CREATE_TIMEOUT_MS);
+        return info; // si tarda, devuelve lo que hay, sin romper
+      })(),
+    ]);
+    return out;
+  } finally {
+    // IMPORTANTE: si terminó de crear, limpia el lock
+    const s = sessions.get(tenantId);
+    if (s) s.connectingPromise = null;
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -1142,12 +1307,11 @@ async function getOrCreateSession(tenantId) {
 app.get("/health", (req, res) => res.json({ ok: true, active_sessions: sessions.size }));
 
 /**
- * ✅ Estado REAL (memoria + DB fallback) — no miente al reiniciar Render
+ * ✅ Estado REAL (memoria + DB fallback)
  */
 app.get("/sessions/:tenantId", async (req, res) => {
   const tenantId = req.params.tenantId;
 
-  // 1) memoria
   const info = sessions.get(tenantId);
   if (info) {
     return res.json({
@@ -1157,12 +1321,14 @@ app.get("/sessions/:tenantId", async (req, res) => {
         status: info.status,
         qr_data: info.qr || null,
         phone_number: info.socket?.user?.id?.split(":")[0] || null,
+        last_connected_at: info.lastConnectedAt || null,
+        last_qr_at: info.lastQrAt || null,
+        next_reconnect_at: info.nextReconnectAt || null,
         source: "memory",
       },
     });
   }
 
-  // 2) DB fallback
   const { data, error } = await supabase
     .from("whatsapp_sessions")
     .select("tenant_id, status, qr_data, phone_number, last_seen_at, last_connected_at")
@@ -1194,31 +1360,44 @@ app.get("/sessions/:tenantId", async (req, res) => {
   });
 });
 
-// 🔥 CORRECCIÓN 2: Fuerza limpieza para evitar QR viejo
+/**
+ * ✅ /connect CORREGIDO:
+ * - NO hace logout si está "connecting" (eso provocaba QR loop)
+ * - Si ya está conectado => ok
+ * - Si está en QR => no recrea socket, solo devuelve estado
+ */
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
+
   try {
-    // 1. Matar sesión vieja si existe y está trabada
     const existing = sessions.get(tenantId);
-    if (existing && existing.status !== "connected") {
-      try { await existing.socket.logout(); } catch(e) {}
-      sessions.delete(tenantId);
+
+    // si ya conectado, no hagas nada
+    if (existing?.status === "connected") {
+      return res.json({ ok: true, status: "connected" });
     }
 
-    // 2. Crear nueva fresca
-    const info = await getOrCreateSession(tenantId);
-    
-    // espera un poco por si conecta rápido
+    // si ya está en QR, no recrees
+    if (existing?.status === "qrcode") {
+      return res.json({ ok: true, status: "qrcode" });
+    }
+
+    // Si no existe o está desconectado, crea / reconecta
+    await getOrCreateSession(tenantId);
+
     const s = await waitForConnected(tenantId, 2500);
     return res.json({
       ok: true,
-      status: s?.status || info.status || "connecting",
+      status: s?.status || "connecting",
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message || "connect_failed" });
   }
 });
 
+/**
+ * ✅ disconnect: logout real
+ */
 app.post("/sessions/:tenantId/disconnect", async (req, res) => {
   const tenantId = req.params.tenantId;
   const s = sessions.get(tenantId);
@@ -1267,9 +1446,7 @@ async function sendTextForTenant({ tenantId, to, message, options }) {
 }
 
 /**
- * ✅ Endpoint principal para N8N:
  * POST /sessions/:tenantId/messages
- * body: { "to": "...", "message": "...", "options": {...} }
  */
 app.post("/sessions/:tenantId/messages", requireAuth, async (req, res) => {
   const { tenantId } = req.params;
@@ -1289,8 +1466,7 @@ app.post("/sessions/:tenantId/messages", requireAuth, async (req, res) => {
 });
 
 /**
- * ✅ Alias retro: POST /sessions/:tenantId/send-message
- * body: { phone, message }
+ * POST /sessions/:tenantId/send-message (alias)
  */
 app.post("/sessions/:tenantId/send-message", requireAuth, async (req, res) => {
   const { tenantId } = req.params;
@@ -1309,7 +1485,7 @@ app.post("/sessions/:tenantId/send-message", requireAuth, async (req, res) => {
   return res.status(500).json(out);
 });
 
-// ------------------- Templates / Media (tu lógica intacta) ------------
+// ------------------- Templates / Media (TU CÓDIGO intacto) ------------
 
 app.post("/sessions/:tenantId/send-template", requireAuth, async (req, res) => {
   const { tenantId } = req.params;
@@ -1413,7 +1589,7 @@ app.post("/sessions/:tenantId/send-media", requireAuth, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 12. Availability (tu lógica intacta)
+// 12. Availability (TU CÓDIGO intacto)
 // ---------------------------------------------------------------------
 
 app.get("/api/v1/availability", async (req, res) => {
@@ -1453,14 +1629,7 @@ app.get("/api/v1/availability", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 13-15. Booking endpoints (TU CÓDIGO)
-// ---------------------------------------------------------------------
-// ✅ Aquí pega tus endpoints create-booking, reschedule-booking, cancel-booking EXACTOS.
-// (Los tuyos estaban bien; el bug real era estado/sesión y endpoints n8n.)
-// ---------------------------------------------------------------------
-
-// ---------------------------------------------------------------------
-// 16. restoreSessions
+// 16. restoreSessions (CORREGIDO: revive connected con guardrails)
 // ---------------------------------------------------------------------
 
 async function restoreSessions() {
@@ -1468,8 +1637,7 @@ async function restoreSessions() {
     logger.info("♻️ Restaurando sesiones (DB)...");
     const { data, error } = await supabase
       .from("whatsapp_sessions")
-      .select("tenant_id, status")
-      // 🔥 CORRECCIÓN 1: Solo revivir 'connected'. Ignorar QRs viejos.
+      .select("tenant_id, status, last_connected_at")
       .eq("status", "connected");
 
     if (error) {
@@ -1481,8 +1649,10 @@ async function restoreSessions() {
     for (const row of data) {
       const tenantId = row.tenant_id;
       try {
+        // Guardrail: no levantes 500 al mismo tiempo
         await getOrCreateSession(tenantId);
         await updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() });
+        await sleep(250);
       } catch (e) {
         logger.error({ tenantId, e }, "restoreSessions: failed");
       }
