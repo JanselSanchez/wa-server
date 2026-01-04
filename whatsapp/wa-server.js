@@ -1,5 +1,5 @@
 /**
- * wa-server.js — versión producción (lista para vender)
+ * wa-server.js — producción (lista para vender)
  *
  * ✅ Multi-tenant real
  * ✅ NO QR spam (throttle + anti-loop + /connect seguro)
@@ -7,10 +7,12 @@
  * ✅ Solo pide QR cuando es logout real
  * ✅ Persistencia auth por filesystem (Render Persistent Disk recomendado)
  * ✅ DB sync: whatsapp_sessions + tenants.wa_connected
+ * ✅ QR fresco: GET /sessions/:tenantId/qr (fuerza connect + NO devuelve QR viejo de DB)
  *
  * Endpoints:
  * - GET  /health
  * - GET  /sessions/:tenantId
+ * - GET  /sessions/:tenantId/qr         ✅ NUEVO (QR fresco, force-connect)
  * - POST /sessions/:tenantId/connect
  * - POST /sessions/:tenantId/disconnect
  * - POST /sessions/:tenantId/messages   (Bearer opcional)
@@ -103,7 +105,8 @@ const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
  *   lastQrAt,
  *   reconnectAttempts,
  *   nextReconnectAt,
- *   connectingPromise
+ *   connectingPromise,
+ *   sessionFolder
  * }
  */
 const sessions = new Map();
@@ -166,14 +169,13 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function waitForConnected(tenantId, timeoutMs = 12000) {
+async function waitForConnectedOrQr(tenantId, timeoutMs = 12000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const s = sessions.get(tenantId);
     if (s?.status === "connected" && s?.socket) return s;
-    // Si está en QR, no esperes más
-    if (s?.status === "qrcode") return s;
-    await sleep(350);
+    if (s?.status === "qrcode" && s?.qr) return s;
+    await sleep(300);
   }
   return sessions.get(tenantId) || null;
 }
@@ -933,15 +935,17 @@ async function useFileAuthState(tenantId) {
 }
 
 // ---------------------------------------------------------------------
-// 10. CORE WHATSAPP (Baileys + n8n) — CORREGIDO ANTI-QR SPAM
+// 10. CORE WHATSAPP (Baileys + n8n) — ANTI-QR SPAM + QR FRESCO
 // ---------------------------------------------------------------------
 
-const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 15000); // no más de 1 QR cada 15s por tenant
+const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 15000);
 const RECONNECT_BASE_MS = Number(process.env.RECONNECT_BASE_MS || 2000);
 const RECONNECT_MAX_MS = Number(process.env.RECONNECT_MAX_MS || 60000);
 const CONNECT_CREATE_TIMEOUT_MS = Number(process.env.CONNECT_CREATE_TIMEOUT_MS || 15000);
 
-// flags para no tumbar proceso
+// Si DB dice qrcode pero no hay memoria, NO lo consideres válido pasado este tiempo
+const DB_QR_MAX_AGE_MS = Number(process.env.DB_QR_MAX_AGE_MS || 60_000); // 60s
+
 process.on("unhandledRejection", (reason) => {
   console.error("[wa-server] unhandledRejection:", reason);
 });
@@ -950,21 +954,17 @@ process.on("uncaughtException", (err) => {
 });
 
 function computeBackoffMs(attempts) {
-  const raw = RECONNECT_BASE_MS * Math.pow(2, Math.min(attempts, 6)); // 2s,4,8,16,32,64
+  const raw = RECONNECT_BASE_MS * Math.pow(2, Math.min(attempts, 6));
   const jitter = Math.floor(Math.random() * 500);
   return Math.min(raw + jitter, RECONNECT_MAX_MS);
 }
 
 async function safeCloseSocket(sock) {
   if (!sock) return;
-  try {
-    // end() es menos agresivo que logout()
-    sock.end?.();
-  } catch {}
+  try { sock.end?.(); } catch {}
 }
 
 async function maybeDeleteAuthFolder(sessionFolder) {
-  // Solo usar cuando logout real; en ese caso necesitas QR nuevo.
   try {
     if (sessionFolder && fs.existsSync(sessionFolder)) {
       fs.rmSync(sessionFolder, { recursive: true, force: true });
@@ -974,25 +974,15 @@ async function maybeDeleteAuthFolder(sessionFolder) {
   }
 }
 
-/**
- * getOrCreateSession
- * - NO crea 2 sockets por tenant (lock via connectingPromise)
- * - NO hace logout agresivo
- * - Reconecta con backoff
- * - QR throttle
- */
 async function getOrCreateSession(tenantId) {
   const current = sessions.get(tenantId);
 
-  // Si ya está conectado, listo
   if (current?.socket && current.status === "connected") return current;
 
-  // Si está conectando, espera el mismo promise
   if (current?.connectingPromise) {
     return await current.connectingPromise;
   }
 
-  // Crea estructura base si no existe
   const info = current || {
     tenantId,
     socket: null,
@@ -1005,18 +995,18 @@ async function getOrCreateSession(tenantId) {
     reconnectAttempts: 0,
     nextReconnectAt: null,
     connectingPromise: null,
+    sessionFolder: null,
   };
 
   sessions.set(tenantId, info);
 
-  // Promise lock para evitar doble instancia por tenant
   info.connectingPromise = (async () => {
     logger.info({ tenantId }, "🔌 Creando socket...");
 
     const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
     const { state, saveCreds, sessionFolder } = await useFileAuthState(tenantId);
+    info.sessionFolder = sessionFolder;
 
-    // Cierra socket previo si existe
     if (info.socket) {
       await safeCloseSocket(info.socket);
       info.socket = null;
@@ -1037,41 +1027,35 @@ async function getOrCreateSession(tenantId) {
       browser: ["PymeBot", "Chrome", "1.0.0"],
       syncFullHistory: false,
       connectTimeoutMs: 60000,
-      // 🔥 IMPORTANT: evita loops por queries
-      // markOnlineOnConnect: false,
     });
 
     info.socket = sock;
 
-    // ---- connection.update
     sock.ev.on("connection.update", async (update) => {
       const { connection, qr, lastDisconnect } = update;
 
-      // QR throttle para evitar spam
       if (qr) {
         const now = Date.now();
         const last = info.lastQrAt ? new Date(info.lastQrAt).getTime() : 0;
+
         if (now - last >= QR_THROTTLE_MS) {
           info.status = "qrcode";
           info.qr = qr;
           info.lastQrAt = new Date().toISOString();
 
-          logger.info({ tenantId }, "✨ QR Generado (throttled ok)");
+          logger.info({ tenantId }, "✨ QR Generado");
+
           await updateSessionDB(tenantId, {
             qr_data: qr,
             status: "qrcode",
             last_seen_at: new Date().toISOString(),
           });
 
-          // debug
           if (String(process.env.PRINT_QR_LOGS || "").trim() === "1") {
             qrcode.generate(qr, { small: true });
           }
         } else {
-          logger.warn(
-            { tenantId },
-            "⚠️ QR recibido pero ignorado por throttle (evita spam/loops)"
-          );
+          logger.warn({ tenantId }, "⚠️ QR recibido pero ignorado por throttle");
         }
       }
 
@@ -1096,8 +1080,6 @@ async function getOrCreateSession(tenantId) {
 
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode;
-
-        // Default: reconectar, excepto logout real
         const isLoggedOut = code === DisconnectReason.loggedOut;
 
         logger.warn({ tenantId, code, isLoggedOut }, "⚠️ connection.close");
@@ -1105,7 +1087,6 @@ async function getOrCreateSession(tenantId) {
         info.socket = null;
 
         if (isLoggedOut) {
-          // logout real => borrar auth folder para forzar QR nuevo limpio
           info.status = "disconnected";
           info.qr = null;
 
@@ -1121,7 +1102,6 @@ async function getOrCreateSession(tenantId) {
           return;
         }
 
-        // Caída normal => reconectar con backoff
         info.status = "connecting";
         info.qr = null;
         info.reconnectAttempts = (info.reconnectAttempts || 0) + 1;
@@ -1138,10 +1118,8 @@ async function getOrCreateSession(tenantId) {
         logger.info({ tenantId, waitMs }, "♻️ Reconnect scheduled");
 
         setTimeout(() => {
-          // si mientras tanto alguien conectó, no hagas nada
           const s = sessions.get(tenantId);
           if (s?.status === "connected") return;
-          // dispara reconexión
           getOrCreateSession(tenantId).catch((e) =>
             logger.error({ tenantId, e }, "Reconnect failed")
           );
@@ -1149,7 +1127,6 @@ async function getOrCreateSession(tenantId) {
       }
     });
 
-    // ---- creds.update (persistir)
     sock.ev.on("creds.update", async () => {
       try {
         await saveCreds();
@@ -1159,7 +1136,7 @@ async function getOrCreateSession(tenantId) {
       }
     });
 
-    // ---- mensajes entrantes (TU CÓDIGO intacto, pero usando info.socket que existe)
+    // Mensajes entrantes (tu lógica intacta)
     sock.ev.on("messages.upsert", async (m) => {
       try {
         const msg = m.messages?.[0];
@@ -1289,12 +1266,11 @@ async function getOrCreateSession(tenantId) {
       info.connectingPromise,
       (async () => {
         await sleep(CONNECT_CREATE_TIMEOUT_MS);
-        return info; // si tarda, devuelve lo que hay, sin romper
+        return info;
       })(),
     ]);
     return out;
   } finally {
-    // IMPORTANTE: si terminó de crear, limpia el lock
     const s = sessions.get(tenantId);
     if (s) s.connectingPromise = null;
   }
@@ -1307,7 +1283,7 @@ async function getOrCreateSession(tenantId) {
 app.get("/health", (req, res) => res.json({ ok: true, active_sessions: sessions.size }));
 
 /**
- * ✅ Estado REAL (memoria + DB fallback)
+ * Estado (memoria + DB fallback)
  */
 app.get("/sessions/:tenantId", async (req, res) => {
   const tenantId = req.params.tenantId;
@@ -1331,7 +1307,7 @@ app.get("/sessions/:tenantId", async (req, res) => {
 
   const { data, error } = await supabase
     .from("whatsapp_sessions")
-    .select("tenant_id, status, qr_data, phone_number, last_seen_at, last_connected_at")
+    .select("tenant_id, status, qr_data, phone_number, last_seen_at, last_connected_at, updated_at")
     .eq("tenant_id", tenantId)
     .maybeSingle();
 
@@ -1346,57 +1322,97 @@ app.get("/sessions/:tenantId", async (req, res) => {
     });
   }
 
+  // ✅ Guardrail: NO devuelvas QR viejo como "válido" si wa-server no lo tiene en memoria
+  // Si el status es qrcode pero no ha sido visto recientemente, fuerza a usar /qr.
+  const updatedAt = data.updated_at ? new Date(data.updated_at).getTime() : 0;
+  const ageMs = updatedAt ? Date.now() - updatedAt : Number.MAX_SAFE_INTEGER;
+
+  const safeQr =
+    (data.status === "qrcode" && ageMs <= DB_QR_MAX_AGE_MS) ? (data.qr_data || null) : null;
+
+  const safeStatus =
+    (data.status === "qrcode" && !safeQr) ? "connecting" : (data.status || "disconnected");
+
   return res.json({
     ok: true,
     session: {
       id: data.tenant_id,
-      status: data.status || "disconnected",
-      qr_data: data.qr_data || null,
+      status: safeStatus,
+      qr_data: safeQr,
       phone_number: data.phone_number || null,
       last_seen_at: data.last_seen_at || null,
       last_connected_at: data.last_connected_at || null,
       source: "db",
+      note: (data.status === "qrcode" && !safeQr) ? "db_qr_stale_ignored_use_/qr" : null,
     },
   });
 });
 
 /**
- * ✅ /connect CORREGIDO:
- * - NO hace logout si está "connecting" (eso provocaba QR loop)
- * - Si ya está conectado => ok
- * - Si está en QR => no recrea socket, solo devuelve estado
+ * ✅ NUEVO: QR fresco (force-connect)
+ * - Siempre intenta crear sesión en memoria
+ * - Si ya está connected -> devuelve connected
+ * - Si llega a qrcode -> devuelve qr_data real
+ */
+app.get("/sessions/:tenantId/qr", async (req, res) => {
+  const tenantId = req.params.tenantId;
+
+  try {
+    await getOrCreateSession(tenantId);
+    const s = await waitForConnectedOrQr(tenantId, 10_000);
+
+    if (s?.status === "connected") {
+      return res.json({ ok: true, status: "connected", qr_data: null, source: "memory" });
+    }
+
+    if (s?.status === "qrcode" && s.qr) {
+      return res.json({ ok: true, status: "qrcode", qr_data: s.qr, source: "memory" });
+    }
+
+    // si aún está conectando
+    return res.json({ ok: true, status: s?.status || "connecting", qr_data: null, source: "memory" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message || "qr_failed" });
+  }
+});
+
+/**
+ * /connect
+ * - Si ya está conectado -> ok
+ * - Si está en QR -> ok
+ * - Si query force=1 -> resetea folder (solo si no está connected)
  */
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
+  const force = String(req.query.force || "").trim() === "1";
 
   try {
     const existing = sessions.get(tenantId);
 
-    // si ya conectado, no hagas nada
     if (existing?.status === "connected") {
       return res.json({ ok: true, status: "connected" });
     }
 
-    // si ya está en QR, no recrees
-    if (existing?.status === "qrcode") {
+    if (existing?.status === "qrcode" && existing.qr) {
       return res.json({ ok: true, status: "qrcode" });
     }
 
-    // Si no existe o está desconectado, crea / reconecta
-    await getOrCreateSession(tenantId);
+    if (force && existing?.sessionFolder) {
+      await maybeDeleteAuthFolder(existing.sessionFolder);
+      sessions.delete(tenantId);
+    }
 
-    const s = await waitForConnected(tenantId, 2500);
-    return res.json({
-      ok: true,
-      status: s?.status || "connecting",
-    });
+    await getOrCreateSession(tenantId);
+    const s = await waitForConnectedOrQr(tenantId, 2500);
+
+    return res.json({ ok: true, status: s?.status || "connecting" });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message || "connect_failed" });
   }
 });
 
 /**
- * ✅ disconnect: logout real
+ * disconnect: logout real
  */
 app.post("/sessions/:tenantId/disconnect", async (req, res) => {
   const tenantId = req.params.tenantId;
@@ -1416,7 +1432,7 @@ app.post("/sessions/:tenantId/disconnect", async (req, res) => {
 
 async function sendTextForTenant({ tenantId, to, message, options }) {
   await getOrCreateSession(tenantId).catch(() => {});
-  const session = await waitForConnected(tenantId, 12000);
+  const session = await waitForConnectedOrQr(tenantId, 12000);
 
   if (!session || !session.socket) {
     return { ok: false, error: "wa_not_connected" };
@@ -1445,9 +1461,6 @@ async function sendTextForTenant({ tenantId, to, message, options }) {
   }
 }
 
-/**
- * POST /sessions/:tenantId/messages
- */
 app.post("/sessions/:tenantId/messages", requireAuth, async (req, res) => {
   const { tenantId } = req.params;
   const { to, message, options } = req.body || {};
@@ -1465,9 +1478,6 @@ app.post("/sessions/:tenantId/messages", requireAuth, async (req, res) => {
   return res.status(500).json(out);
 });
 
-/**
- * POST /sessions/:tenantId/send-message (alias)
- */
 app.post("/sessions/:tenantId/send-message", requireAuth, async (req, res) => {
   const { tenantId } = req.params;
   const { phone, message } = req.body || {};
@@ -1494,7 +1504,7 @@ app.post("/sessions/:tenantId/send-template", requireAuth, async (req, res) => {
   if (!event || !phone) return res.status(400).json({ ok: false, error: "missing_fields" });
 
   await getOrCreateSession(tenantId).catch(() => {});
-  const session = await waitForConnected(tenantId, 12000);
+  const session = await waitForConnectedOrQr(tenantId, 12000);
 
   if (!session || session.status === "qrcode") {
     return res.status(409).json({ ok: false, error: "qrcode_required" });
@@ -1550,7 +1560,7 @@ app.post("/sessions/:tenantId/send-media", requireAuth, async (req, res) => {
   }
 
   await getOrCreateSession(tenantId).catch(() => {});
-  const session = await waitForConnected(tenantId, 12000);
+  const session = await waitForConnectedOrQr(tenantId, 12000);
 
   if (!session || session.status === "qrcode") {
     return res.status(409).json({ ok: false, error: "qrcode_required" });
@@ -1629,7 +1639,7 @@ app.get("/api/v1/availability", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 16. restoreSessions (CORREGIDO: revive connected con guardrails)
+// 16. restoreSessions (revive connected con guardrails)
 // ---------------------------------------------------------------------
 
 async function restoreSessions() {
@@ -1637,7 +1647,7 @@ async function restoreSessions() {
     logger.info("♻️ Restaurando sesiones (DB)...");
     const { data, error } = await supabase
       .from("whatsapp_sessions")
-      .select("tenant_id, status, last_connected_at")
+      .select("tenant_id, status")
       .eq("status", "connected");
 
     if (error) {
@@ -1649,7 +1659,6 @@ async function restoreSessions() {
     for (const row of data) {
       const tenantId = row.tenant_id;
       try {
-        // Guardrail: no levantes 500 al mismo tiempo
         await getOrCreateSession(tenantId);
         await updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() });
         await sleep(250);
