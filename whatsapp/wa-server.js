@@ -5,17 +5,17 @@
  * ✅ NO QR spam (throttle + anti-loop + /connect seguro)
  * ✅ Reconexión robusta (backoff)
  * ✅ Solo pide QR cuando es logout real
- * ✅ Persistencia auth por filesystem (Render Persistent Disk recomendado)
+ * ✅ Persistencia auth por BASE DE DATOS (Supabase) - Inmortal ante reinicios 🛡️
  * ✅ DB sync: whatsapp_sessions + tenants.wa_connected
  * ✅ QR fresco: GET /sessions/:tenantId/qr (fuerza connect + NO devuelve QR viejo de DB)
  *
  * Endpoints:
  * - GET  /health
  * - GET  /sessions/:tenantId
- * - GET  /sessions/:tenantId/qr         ✅ NUEVO (QR fresco, force-connect)
+ * - GET  /sessions/:tenantId/qr          ✅ NUEVO (QR fresco, force-connect)
  * - POST /sessions/:tenantId/connect
  * - POST /sessions/:tenantId/disconnect
- * - POST /sessions/:tenantId/messages   (Bearer opcional)
+ * - POST /sessions/:tenantId/messages    (Bearer opcional)
  * - POST /sessions/:tenantId/send-message (alias)
  * - POST /sessions/:tenantId/send-template
  * - POST /sessions/:tenantId/send-media
@@ -33,6 +33,9 @@ const { createClient } = require("@supabase/supabase-js");
 const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
+
+// 👇 Importamos el adaptador de Auth DB (Asegúrate de haber creado auth-db.js)
+const { useSupabaseAuthState } = require("./auth-db");
 
 // Date-fns
 const { startOfWeek, addDays, startOfDay } = require("date-fns");
@@ -95,32 +98,21 @@ const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
 /**
  * sessions: Map<tenantId, info>
  * info: {
- *   tenantId,
- *   socket,
- *   status: 'idle'|'connecting'|'connected'|'qrcode'|'disconnected',
- *   qr,
- *   conversations: Map<phone, {history: []}>,
- *   createdAt,
- *   lastConnectedAt,
- *   lastQrAt,
- *   reconnectAttempts,
- *   nextReconnectAt,
- *   connectingPromise,
- *   sessionFolder
+ * tenantId,
+ * socket,
+ * status: 'idle'|'connecting'|'connected'|'qrcode'|'disconnected',
+ * qr,
+ * conversations: Map<phone, {history: []}>,
+ * createdAt,
+ * lastConnectedAt,
+ * lastQrAt,
+ * reconnectAttempts,
+ * nextReconnectAt,
+ * connectingPromise,
+ * sessionFolder (ya no se usa con DB, pero se mantiene por compatibilidad de estructura)
  * }
  */
 const sessions = new Map();
-
-// Persistencia auth state (IMPORTANTE para “no pedir QR cada restart”)
-const WA_SESSIONS_ROOT =
-  process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
-
-// Crea root folder siempre
-try {
-  if (!fs.existsSync(WA_SESSIONS_ROOT)) fs.mkdirSync(WA_SESSIONS_ROOT, { recursive: true });
-} catch (e) {
-  console.error("[wa-server] No pude crear WA_SESSIONS_ROOT:", WA_SESSIONS_ROOT, e);
-}
 
 // ---------------------------------------------------------------------
 // AUTH opcional (Bearer) — recomendado para producción
@@ -921,20 +913,6 @@ function buildBookingEventFromMessage(text, session) {
 }
 
 // ---------------------------------------------------------------------
-// 9. AUTH STATE (Baileys multi-file) — persistencia en WA_SESSIONS_ROOT
-// ---------------------------------------------------------------------
-
-async function useFileAuthState(tenantId) {
-  const { useMultiFileAuthState } = await import("@whiskeysockets/baileys");
-  const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
-
-  if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-  return { state, saveCreds, sessionFolder };
-}
-
-// ---------------------------------------------------------------------
 // 10. CORE WHATSAPP (Baileys + n8n) — ANTI-QR SPAM + QR FRESCO
 // ---------------------------------------------------------------------
 
@@ -964,16 +942,6 @@ async function safeCloseSocket(sock) {
   try { sock.end?.(); } catch {}
 }
 
-async function maybeDeleteAuthFolder(sessionFolder) {
-  try {
-    if (sessionFolder && fs.existsSync(sessionFolder)) {
-      fs.rmSync(sessionFolder, { recursive: true, force: true });
-    }
-  } catch (e) {
-    console.error("[wa-server] No pude borrar auth folder:", e?.message || e);
-  }
-}
-
 async function getOrCreateSession(tenantId) {
   const current = sessions.get(tenantId);
 
@@ -995,17 +963,19 @@ async function getOrCreateSession(tenantId) {
     reconnectAttempts: 0,
     nextReconnectAt: null,
     connectingPromise: null,
-    sessionFolder: null,
+    sessionFolder: null, // Ya no se usa con AuthDB
   };
 
   sessions.set(tenantId, info);
 
   info.connectingPromise = (async () => {
-    logger.info({ tenantId }, "🔌 Creando socket...");
+    logger.info({ tenantId }, "🔌 Creando socket (MODO PRO - DB)...");
 
     const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
-    const { state, saveCreds, sessionFolder } = await useFileAuthState(tenantId);
-    info.sessionFolder = sessionFolder;
+    
+    // 👇 CAMBIO CLAVE: Usamos la DB en lugar de archivos locales
+    const { state, saveCreds } = await useSupabaseAuthState(supabase, tenantId);
+    info.sessionFolder = null; // No hay carpeta local
 
     if (info.socket) {
       await safeCloseSocket(info.socket);
@@ -1090,7 +1060,9 @@ async function getOrCreateSession(tenantId) {
           info.status = "disconnected";
           info.qr = null;
 
-          await maybeDeleteAuthFolder(sessionFolder);
+          // 👇 CAMBIO CLAVE: Borrado de sesión en DB
+          await supabase.from("wa_auth").delete().eq("tenant_id", tenantId);
+          logger.info({ tenantId }, "🧹 Sesión borrada de la DB por logout.");
 
           await updateSessionDB(tenantId, {
             status: "disconnected",
@@ -1098,7 +1070,6 @@ async function getOrCreateSession(tenantId) {
             last_seen_at: new Date().toISOString(),
           });
 
-          logger.info({ tenantId }, "❌ Logout real: requiere QR nuevo.");
           return;
         }
 
@@ -1380,7 +1351,7 @@ app.get("/sessions/:tenantId/qr", async (req, res) => {
  * /connect
  * - Si ya está conectado -> ok
  * - Si está en QR -> ok
- * - Si query force=1 -> resetea folder (solo si no está connected)
+ * - Si query force=1 -> resetea (borra DB) solo si no está connected
  */
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
@@ -1397,8 +1368,10 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
       return res.json({ ok: true, status: "qrcode" });
     }
 
-    if (force && existing?.sessionFolder) {
-      await maybeDeleteAuthFolder(existing.sessionFolder);
+    if (force) {
+      // 👇 BORRADO EN DB en vez de Filesystem
+      await supabase.from("wa_auth").delete().eq("tenant_id", tenantId);
+      logger.info({ tenantId }, "⚠️ Force connect: sesión borrada de DB");
       sessions.delete(tenantId);
     }
 
@@ -1422,6 +1395,8 @@ app.post("/sessions/:tenantId/disconnect", async (req, res) => {
     if (s?.socket) await s.socket.logout().catch(() => {});
   } finally {
     sessions.delete(tenantId);
+    // 👇 También borramos la sesión persistente para evitar zombies
+    await supabase.from("wa_auth").delete().eq("tenant_id", tenantId);
     await updateSessionDB(tenantId, { status: "disconnected", qr_data: null });
   }
 
