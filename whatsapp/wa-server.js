@@ -1111,19 +1111,22 @@ async function getOrCreateSession(tenantId) {
   // -----------------------------------------------------
     // CORRECCIÓN: Evento messages.upsert BLINDADO 🛡️
     // -----------------------------------------------------
+  // ------------------------------------------------------------------------------------------------
+    // EVENTO MESSAGES.UPSERT (MODO DEBUG "RAYO X" ACTIVADO 🕵️‍♂️)
+    // ------------------------------------------------------------------------------------------------
     sock.ev.on("messages.upsert", async (m) => {
       try {
         const msg = m.messages?.[0];
         if (!msg) return;
-        
+
         // 1. Ignorar mensajes propios (del bot) o sin contenido
         if (!msg.message || msg.key.fromMe) return;
 
-        // 2. Obtener el Remote JID (Quién escribe)
-        // Prioridad: participant (si es grupo) > remoteJid (privado)
+        // 2. Obtener el Remote JID (Identificador crudo)
+        // Prioridad: participant (grupos) > remoteJid (privado)
         const rawJid = msg.key.participant || msg.key.remoteJid;
 
-        // 3. Ignorar Grupos (@g.us) y Broadcasts (@broadcast)
+        // 3. Ignorar Grupos (@g.us) y Broadcasts
         if (!rawJid || rawJid.includes("@g.us") || rawJid.includes("status@broadcast")) return;
 
         // 4. Extraer texto
@@ -1136,12 +1139,21 @@ async function getOrCreateSession(tenantId) {
 
         const pushName = msg.pushName || "Cliente";
 
-        // 🚨 AQUÍ ESTÁ LA CORRECCIÓN CLAVE DEL NÚMERO 🚨
-        // Quitamos el @s.whatsapp.net Y TAMBIÉN el :DeviceID (ej: :2, :88)
-        const userPhone = rawJid.replace(/:[0-9]+@/, "@").split("@")[0].split(":")[0];
+        // ==================================================================================
+        // 🕵️‍♂️ ZONA DE DEBUG "RAYO X" (Para encontrar el 829)
+        // ==================================================================================
+        console.log('=============================================');
+        console.log('🕵️‍♂️ CAZANDO EL 829 - INSPECCIÓN TOTAL:');
+        console.log('1. JID CRUDO (rawJid):', rawJid);
+        console.log('2. KEYS COMPLETAS:', JSON.stringify(msg.key, null, 2));
+        console.log('3. PARTICIPANT EXTRA:', msg.participant || "undefined");
+        console.log('4. PUSHNAME:', pushName);
+        console.log('=============================================');
+        // ==================================================================================
 
-        // 🔍 DEBUG LOG: Esto saldrá en la consola de Render para confirmar
-        console.log(`[DEBUG] 📩 Mensaje de: ${pushName} | JID: ${rawJid} -> CleanPhone: ${userPhone}`);
+        // 🚨 LIMPIEZA DE NÚMERO (Provisional hasta ver los logs)
+        // Intenta limpiar el LID y quitar sufijos de dispositivo (:2, :99)
+        const userPhone = rawJid.replace(/:[0-9]+@/, "@").split("@")[0].split(":")[0];
 
         // --- Gestión de Historial (Tu código original) ---
         let convo = info.conversations.get(userPhone);
@@ -1165,7 +1177,7 @@ async function getOrCreateSession(tenantId) {
           const payload = {
             tenantId,
             customerId,
-            phoneNumber: userPhone, // ✅ Ahora lleva el número 100% limpio
+            phoneNumber: userPhone, // 👈 Aquí va el número limpio
             text,
             customerName: pushName,
             state: {
@@ -1225,7 +1237,8 @@ async function getOrCreateSession(tenantId) {
         }
 
         // --- Enviar Respuesta ---
-        await sock.sendMessage(rawJid, { text: replyText }); // Usamos rawJid para responder seguro
+        // IMPORTANTE: Usamos rawJid para responder porque es la dirección técnica correcta (aunque sea LID)
+        await sock.sendMessage(rawJid, { text: replyText });
 
         // --- Enviar ICS si aplica ---
         if (icsData) {
