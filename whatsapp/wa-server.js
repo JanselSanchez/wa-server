@@ -1108,15 +1108,25 @@ async function getOrCreateSession(tenantId) {
     });
 
     // Mensajes entrantes (tu lógica intacta)
+  // -----------------------------------------------------
+    // CORRECCIÓN: Evento messages.upsert BLINDADO 🛡️
+    // -----------------------------------------------------
     sock.ev.on("messages.upsert", async (m) => {
       try {
         const msg = m.messages?.[0];
         if (!msg) return;
-        if (!msg?.message || msg.key.fromMe) return;
+        
+        // 1. Ignorar mensajes propios (del bot) o sin contenido
+        if (!msg.message || msg.key.fromMe) return;
 
-        const remoteJid = msg.key.remoteJid;
-        if (!remoteJid || remoteJid.includes("@g.us")) return;
+        // 2. Obtener el Remote JID (Quién escribe)
+        // Prioridad: participant (si es grupo) > remoteJid (privado)
+        const rawJid = msg.key.participant || msg.key.remoteJid;
 
+        // 3. Ignorar Grupos (@g.us) y Broadcasts (@broadcast)
+        if (!rawJid || rawJid.includes("@g.us") || rawJid.includes("status@broadcast")) return;
+
+        // 4. Extraer texto
         const text =
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
@@ -1125,8 +1135,15 @@ async function getOrCreateSession(tenantId) {
         if (!text) return;
 
         const pushName = msg.pushName || "Cliente";
-        const userPhone = remoteJid.split("@")[0];
 
+        // 🚨 AQUÍ ESTÁ LA CORRECCIÓN CLAVE DEL NÚMERO 🚨
+        // Quitamos el @s.whatsapp.net Y TAMBIÉN el :DeviceID (ej: :2, :88)
+        const userPhone = rawJid.replace(/:[0-9]+@/, "@").split("@")[0].split(":")[0];
+
+        // 🔍 DEBUG LOG: Esto saldrá en la consola de Render para confirmar
+        console.log(`[DEBUG] 📩 Mensaje de: ${pushName} | JID: ${rawJid} -> CleanPhone: ${userPhone}`);
+
+        // --- Gestión de Historial (Tu código original) ---
         let convo = info.conversations.get(userPhone);
         if (!convo) {
           convo = { history: [] };
@@ -1148,7 +1165,7 @@ async function getOrCreateSession(tenantId) {
           const payload = {
             tenantId,
             customerId,
-            phoneNumber: userPhone,
+            phoneNumber: userPhone, // ✅ Ahora lleva el número 100% limpio
             text,
             customerName: pushName,
             state: {
@@ -1160,6 +1177,7 @@ async function getOrCreateSession(tenantId) {
           };
 
           try {
+            // Enviamos a n8n
             const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
             const d = response?.data || null;
 
@@ -1179,6 +1197,7 @@ async function getOrCreateSession(tenantId) {
           logger.error("[wa-server] N8N_WEBHOOK_URL no está configurado.");
         }
 
+        // --- Fallback IA Local (Tu código original) ---
         if (!replyText) {
           const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
           replyText =
@@ -1192,6 +1211,7 @@ async function getOrCreateSession(tenantId) {
           };
         }
 
+        // --- Actualizar Estado (Tu código original) ---
         if (newState) {
           try {
             await convoState.updateSession(convoSession.id, {
@@ -1204,16 +1224,19 @@ async function getOrCreateSession(tenantId) {
           }
         }
 
-        await sock.sendMessage(remoteJid, { text: replyText });
+        // --- Enviar Respuesta ---
+        await sock.sendMessage(rawJid, { text: replyText }); // Usamos rawJid para responder seguro
 
+        // --- Enviar ICS si aplica ---
         if (icsData) {
-          const ok = await sendICS(sock, remoteJid, icsData, {
+          const ok = await sendICS(sock, rawJid, icsData, {
             fileName: "cita_confirmada.ics",
             caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
           });
           if (!ok) logger.warn({ tenantId }, "⚠️ icsData inválido (texto/base64).");
         }
 
+        // --- Guardar Historial ---
         history.push({ role: "user", content: text });
         history.push({ role: "assistant", content: replyText });
 
