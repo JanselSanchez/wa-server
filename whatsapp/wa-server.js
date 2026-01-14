@@ -1118,150 +1118,173 @@ async function getOrCreateSession(tenantId) {
     // EVENTO MESSAGES.UPSERT (CORREGIDO: PRIORIDAD REMOTE_JID_ALT)
     // ------------------------------------------------------------------------------------------------
     sock.ev.on("messages.upsert", async (m) => {
+  try {
+    const msg = m.messages?.[0];
+    if (!msg) return;
+
+    // 1. Ignorar mensajes propios (del bot) o sin contenido
+    if (!msg.message || msg.key.fromMe) return;
+
+    // 2. OBTENER EL JID REAL (Corrección Maestra) 🏆
+    // Prioridad:
+    // A. Participant (si es grupo)
+    // B. remoteJidAlt (si es chat privado con LID - ¡Aquí vive tu 829!)
+    // C. remoteJid (fallback estándar)
+    const rawJid = msg.key.participant || msg.key.remoteJidAlt || msg.key.remoteJid;
+
+    // 3. Ignorar Grupos (@g.us) y Broadcasts
+    if (!rawJid || rawJid.includes("@g.us") || rawJid.includes("status@broadcast")) return;
+
+    // 👇 MAGIA 1: EFECTO "ESCRIBIENDO..." INMEDIATO
+    // Esto calma al usuario mientras n8n piensa.
+    await sock.sendPresenceUpdate("composing", rawJid);
+
+    // 4. Extraer texto
+    const text =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
+
+    if (!text) return;
+
+    const pushName = msg.pushName || "Cliente";
+
+    // 5. LIMPIEZA FINAL DEL NÚMERO
+    // Quitamos @s.whatsapp.net, @lid y sufijos de dispositivo (:2)
+    const userPhone = rawJid.replace(/:[0-9]+@/, "@").split("@")[0].split(":")[0];
+
+    // 🔍 DEBUG LOG: Confirmación final
+    console.log(
+      `[DEBUG] 📩 De: ${pushName} | Usando JID: ${rawJid} -> 🏆 Phone: ${userPhone}`
+    );
+
+    // --- Gestión de Historial (Tu código original) ---
+    let convo = info.conversations.get(userPhone);
+    if (!convo) {
+      convo = { history: [] };
+      info.conversations.set(userPhone, convo);
+    }
+    const history = convo.history || [];
+
+    // 👇 MAGIA 2: CACHÉ DE VELOCIDAD
+    // Si ya conocemos al cliente, NO llamamos a la base de datos extra para “ver si existe”.
+    // OJO: tu getOrCreateCustomer igual consulta/crea; el cache evita “lógicas adicionales”
+    // y te deja listo para futuras optimizaciones (ej: guardar customerId también).
+    let customerId = null;
+    const cacheKey = `${tenantId}:${userPhone}`;
+
+    if (customerCache.has(cacheKey)) {
+      // Ya existe en RAM, seguimos rápido.
+      // Si obligatoriamente necesitas customerId siempre, igual lo obtenemos aquí.
+      customerId = await getOrCreateCustomer(tenantId, userPhone);
+    } else {
+      // Primera vez: Vamos a Supabase
+      customerId = await getOrCreateCustomer(tenantId, userPhone);
+      customerCache.add(cacheKey); // ¡Guardado en RAM!
+    }
+
+    const convoSession = await convoState.getOrCreateSession(tenantId, userPhone);
+    const event = buildBookingEventFromMessage(text, convoSession);
+
+    const botApiUrl = process.env.N8N_WEBHOOK_URL;
+
+    let replyText = null;
+    let newState = null;
+    let icsData = null;
+
+    if (botApiUrl) {
+      const payload = {
+        tenantId,
+        customerId,
+        phoneNumber: userPhone, // ✅ AHORA SÍ LLEGARÁ EL 829
+        text,
+        customerName: pushName,
+        state: {
+          current_flow: convoSession.current_flow,
+          step: convoSession.step,
+          payload: convoSession.payload || {},
+        },
+        event,
+      };
+
+      // Llamada a n8n
       try {
-        const msg = m.messages?.[0];
-        if (!msg) return;
+        const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
+        const d = response?.data || null;
 
-        // 1. Ignorar mensajes propios (del bot) o sin contenido
-        if (!msg.message || msg.key.fromMe) return;
+        if (d) {
+          if (typeof d.data === "string") replyText = d.data;
+          if (!replyText && typeof d.replyText === "string") replyText = d.replyText;
+          if (!replyText && typeof d.message === "string") replyText = d.message;
+          if (!replyText && typeof d.reply === "string") replyText = d.reply; // soporte extra
 
-        // 2. OBTENER EL JID REAL (Corrección Maestra) 🏆
-        // Prioridad: 
-        // A. Participant (si es grupo)
-        // B. remoteJidAlt (si es chat privado con LID - ¡Aquí vive tu 829!)
-        // C. remoteJid (fallback estándar)
-        const rawJid = msg.key.participant || msg.key.remoteJidAlt || msg.key.remoteJid;
-
-        // 3. Ignorar Grupos (@g.us) y Broadcasts
-        if (!rawJid || rawJid.includes("@g.us") || rawJid.includes("status@broadcast")) return;
-
-        // 4. Extraer texto
-        const text =
-          msg.message.conversation ||
-          msg.message.extendedTextMessage?.text ||
-          msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text;
-
-        if (!text) return;
-
-        const pushName = msg.pushName || "Cliente";
-
-        // 5. LIMPIEZA FINAL DEL NÚMERO
-        // Quitamos @s.whatsapp.net, @lid y sufijos de dispositivo (:2)
-        const userPhone = rawJid.replace(/:[0-9]+@/, "@").split("@")[0].split(":")[0];
-
-        // 🔍 DEBUG LOG: Confirmación final
-        console.log(`[DEBUG] 📩 De: ${pushName} | Usando JID: ${rawJid} -> 🏆 Phone: ${userPhone}`);
-
-        // --- Gestión de Historial (Tu código original) ---
-        let convo = info.conversations.get(userPhone);
-        if (!convo) {
-          convo = { history: [] };
-          info.conversations.set(userPhone, convo);
+          if (d.newState) newState = d.newState;
+          if (d.icsData) icsData = d.icsData;
         }
-        const history = convo.history || [];
-
-        const convoSession = await convoState.getOrCreateSession(tenantId, userPhone);
-        const customerId = await getOrCreateCustomer(tenantId, userPhone);
-        const event = buildBookingEventFromMessage(text, convoSession);
-
-        const botApiUrl = process.env.N8N_WEBHOOK_URL;
-
-        let replyText = null;
-        let newState = null;
-        let icsData = null;
-
-        if (botApiUrl) {
-          const payload = {
-            tenantId,
-            customerId,
-            phoneNumber: userPhone, // ✅ AHORA SÍ LLEGARÁ EL 829
-            text,
-            customerName: pushName,
-            state: {
-              current_flow: convoSession.current_flow,
-              step: convoSession.step,
-              payload: convoSession.payload || {},
-            },
-            event,
-          };
-
-          try {
-            // Enviamos a n8n
-            const response = await axios.post(botApiUrl, payload, { timeout: 60000 });
-            const d = response?.data || null;
-
-            if (d) {
-              if (typeof d.data === "string") replyText = d.data;
-              if (!replyText && typeof d.replyText === "string") replyText = d.replyText;
-              if (!replyText && typeof d.message === "string") replyText = d.message;
-              if (!replyText && typeof d.reply === "string") replyText = d.reply;
-
-              if (d.newState) newState = d.newState;
-              if (d.icsData) icsData = d.icsData;
-            }
-          } catch (err) {
-            logger.error("[wa-server] Error n8n:", err?.response?.data || err.message);
-          }
-        } else {
-          logger.error("[wa-server] N8N_WEBHOOK_URL no está configurado.");
-        }
-
-        // --- Fallback IA Local ---
-        if (!replyText) {
-          const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
-          replyText =
-            fallback ||
-            "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
-
-          newState = {
-            current_flow: convoSession.current_flow,
-            step: convoSession.step,
-            payload: convoSession.payload || {},
-          };
-        }
-
-        // --- Actualizar Estado ---
-        if (newState) {
-          try {
-            await convoState.updateSession(convoSession.id, {
-              current_flow: newState.current_flow,
-              step: newState.step,
-              payload: newState.payload,
-            });
-          } catch (err) {
-            logger.error("[wa-server] Error actualizando conversación:", err);
-          }
-        }
-
-        // --- Enviar Respuesta ---
-        // IMPORTANTE: Respondemos al JID que recibimos (aunque sea alt o lid, WhatsApp lo rutea bien)
-        await sock.sendMessage(rawJid, { text: replyText });
-
-        // --- Enviar ICS si aplica ---
-        if (icsData) {
-          const ok = await sendICS(sock, rawJid, icsData, {
-            fileName: "cita_confirmada.ics",
-            caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
-          });
-          if (!ok) logger.warn({ tenantId }, "⚠️ icsData inválido (texto/base64).");
-        }
-
-        // --- Guardar Historial ---
-        history.push({ role: "user", content: text });
-        history.push({ role: "assistant", content: replyText });
-
-        const MAX_MESSAGES = 20;
-        if (history.length > MAX_MESSAGES) history.splice(0, history.length - MAX_MESSAGES);
-
-        convo.history = history;
-        info.conversations.set(userPhone, convo);
-
-        updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() }).catch(() => {});
-      } catch (e) {
-        logger.error("[wa-server] Error en messages.upsert:", e);
+      } catch (err) {
+        logger.error("[wa-server] Error n8n:", err?.response?.data || err.message);
       }
-    });
+    } else {
+      logger.error("[wa-server] N8N_WEBHOOK_URL no está configurado.");
+    }
 
+    // --- Fallback IA Local (Si n8n falla) ---
+    if (!replyText) {
+      const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
+      replyText =
+        fallback ||
+        "Ahora mismo no puedo gestionar bien tu solicitud. Inténtalo de nuevo en unos minutos, por favor. 🙏";
+
+      newState = {
+        current_flow: convoSession.current_flow,
+        step: convoSession.step,
+        payload: convoSession.payload || {},
+      };
+    }
+
+    // --- Actualizar Estado (Sin frenar el envío) ---
+    if (newState) {
+      convoState
+        .updateSession(convoSession.id, {
+          current_flow: newState.current_flow,
+          step: newState.step,
+          payload: newState.payload,
+        })
+        .catch((err) => logger.error("[wa-server] Error actualizando conversación:", err));
+    }
+
+    // 👇 MAGIA 3: DETENER "ESCRIBIENDO..." Y ENVIAR
+    await sock.sendPresenceUpdate("paused", rawJid);
+
+    // --- Enviar Respuesta ---
+    // IMPORTANTE: Respondemos al JID que recibimos (aunque sea alt o lid, WhatsApp lo rutea bien)
+    await sock.sendMessage(rawJid, { text: replyText });
+
+    // --- Enviar ICS si aplica ---
+    if (icsData) {
+      const ok = await sendICS(sock, rawJid, icsData, {
+        fileName: "cita_confirmada.ics",
+        caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
+      });
+      if (!ok) logger.warn({ tenantId }, "⚠️ icsData inválido (texto/base64).");
+    }
+
+    // --- Guardar Historial ---
+    history.push({ role: "user", content: text });
+    history.push({ role: "assistant", content: replyText });
+
+    const MAX_MESSAGES = 20;
+    if (history.length > MAX_MESSAGES) history.splice(0, history.length - MAX_MESSAGES);
+
+    convo.history = history;
+    info.conversations.set(userPhone, convo);
+
+    // Actualizar last_seen en segundo plano
+    updateSessionDB(tenantId, { last_seen_at: new Date().toISOString() }).catch(() => {});
+  } catch (e) {
+    logger.error("[wa-server] Error en messages.upsert:", e);
+  }
+});
     return info;
   })();
 
