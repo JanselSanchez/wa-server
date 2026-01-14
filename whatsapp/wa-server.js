@@ -1114,6 +1114,9 @@ async function getOrCreateSession(tenantId) {
   // ------------------------------------------------------------------------------------------------
     // EVENTO MESSAGES.UPSERT (MODO DEBUG "RAYO X" ACTIVADO 🕵️‍♂️)
     // ------------------------------------------------------------------------------------------------
+   // ------------------------------------------------------------------------------------------------
+    // EVENTO MESSAGES.UPSERT (CORREGIDO: PRIORIDAD REMOTE_JID_ALT)
+    // ------------------------------------------------------------------------------------------------
     sock.ev.on("messages.upsert", async (m) => {
       try {
         const msg = m.messages?.[0];
@@ -1122,9 +1125,12 @@ async function getOrCreateSession(tenantId) {
         // 1. Ignorar mensajes propios (del bot) o sin contenido
         if (!msg.message || msg.key.fromMe) return;
 
-        // 2. Obtener el Remote JID (Identificador crudo)
-        // Prioridad: participant (grupos) > remoteJid (privado)
-        const rawJid = msg.key.participant || msg.key.remoteJid;
+        // 2. OBTENER EL JID REAL (Corrección Maestra) 🏆
+        // Prioridad: 
+        // A. Participant (si es grupo)
+        // B. remoteJidAlt (si es chat privado con LID - ¡Aquí vive tu 829!)
+        // C. remoteJid (fallback estándar)
+        const rawJid = msg.key.participant || msg.key.remoteJidAlt || msg.key.remoteJid;
 
         // 3. Ignorar Grupos (@g.us) y Broadcasts
         if (!rawJid || rawJid.includes("@g.us") || rawJid.includes("status@broadcast")) return;
@@ -1139,21 +1145,12 @@ async function getOrCreateSession(tenantId) {
 
         const pushName = msg.pushName || "Cliente";
 
-        // ==================================================================================
-        // 🕵️‍♂️ ZONA DE DEBUG "RAYO X" (Para encontrar el 829)
-        // ==================================================================================
-        console.log('=============================================');
-        console.log('🕵️‍♂️ CAZANDO EL 829 - INSPECCIÓN TOTAL:');
-        console.log('1. JID CRUDO (rawJid):', rawJid);
-        console.log('2. KEYS COMPLETAS:', JSON.stringify(msg.key, null, 2));
-        console.log('3. PARTICIPANT EXTRA:', msg.participant || "undefined");
-        console.log('4. PUSHNAME:', pushName);
-        console.log('=============================================');
-        // ==================================================================================
-
-        // 🚨 LIMPIEZA DE NÚMERO (Provisional hasta ver los logs)
-        // Intenta limpiar el LID y quitar sufijos de dispositivo (:2, :99)
+        // 5. LIMPIEZA FINAL DEL NÚMERO
+        // Quitamos @s.whatsapp.net, @lid y sufijos de dispositivo (:2)
         const userPhone = rawJid.replace(/:[0-9]+@/, "@").split("@")[0].split(":")[0];
+
+        // 🔍 DEBUG LOG: Confirmación final
+        console.log(`[DEBUG] 📩 De: ${pushName} | Usando JID: ${rawJid} -> 🏆 Phone: ${userPhone}`);
 
         // --- Gestión de Historial (Tu código original) ---
         let convo = info.conversations.get(userPhone);
@@ -1177,7 +1174,7 @@ async function getOrCreateSession(tenantId) {
           const payload = {
             tenantId,
             customerId,
-            phoneNumber: userPhone, // 👈 Aquí va el número limpio
+            phoneNumber: userPhone, // ✅ AHORA SÍ LLEGARÁ EL 829
             text,
             customerName: pushName,
             state: {
@@ -1209,7 +1206,7 @@ async function getOrCreateSession(tenantId) {
           logger.error("[wa-server] N8N_WEBHOOK_URL no está configurado.");
         }
 
-        // --- Fallback IA Local (Tu código original) ---
+        // --- Fallback IA Local ---
         if (!replyText) {
           const fallback = await generateReply(text, tenantId, pushName, history, userPhone);
           replyText =
@@ -1223,7 +1220,7 @@ async function getOrCreateSession(tenantId) {
           };
         }
 
-        // --- Actualizar Estado (Tu código original) ---
+        // --- Actualizar Estado ---
         if (newState) {
           try {
             await convoState.updateSession(convoSession.id, {
@@ -1237,7 +1234,7 @@ async function getOrCreateSession(tenantId) {
         }
 
         // --- Enviar Respuesta ---
-        // IMPORTANTE: Usamos rawJid para responder porque es la dirección técnica correcta (aunque sea LID)
+        // IMPORTANTE: Respondemos al JID que recibimos (aunque sea alt o lid, WhatsApp lo rutea bien)
         await sock.sendMessage(rawJid, { text: replyText });
 
         // --- Enviar ICS si aplica ---
