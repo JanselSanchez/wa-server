@@ -11,6 +11,7 @@
  * 🛠️ CORRECCIONES APLICADAS:
  * 1. restoreSessions: Solo revive 'connected' para evitar spam de QRs en logs.
  * 2. /connect: Fuerza limpieza de sesión previa para garantizar QR fresco.
+ * 3. JID FIX: Prioridad a remoteJidAlt o cualquiera que tenga @s.whatsapp.net.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -36,7 +37,6 @@ const convoState = require("./conversationState");
 // ---------------------------------------------------------------------
 
 // ⚠️ En producción NO deberías desactivar TLS.
-// Si tienes un caso puntual (certs raros), habilítalo explícitamente.
 if (String(process.env.ALLOW_INSECURE_TLS || "").trim() === "1") {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
   console.warn(
@@ -80,7 +80,7 @@ const openaiApiKey =
 
 if (!openaiApiKey) {
   console.warn(
-    "[wa-server] ⚠️ No hay API key de OpenAI (OPENAI_API_KEY / OPENAI_KEY). El fallback IA no funcionará."
+    "[wa-server] ⚠️ No hay API key de OpenAI. El fallback IA no funcionará."
   );
 }
 const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
@@ -90,7 +90,7 @@ const openai = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
  */
 const sessions = new Map();
 
-// Persistencia auth state (IMPORTANTE para “no pedir QR cada restart”)
+// Persistencia auth state
 const WA_SESSIONS_ROOT =
   process.env.WA_SESSIONS_DIR || path.join(__dirname, ".wa-sessions");
 
@@ -102,7 +102,7 @@ try {
 }
 
 // ---------------------------------------------------------------------
-// AUTH opcional (Bearer) — recomendado para producción
+// AUTH opcional (Bearer)
 // ---------------------------------------------------------------------
 
 function requireAuth(req, res, next) {
@@ -1010,26 +1010,27 @@ async function getOrCreateSession(tenantId) {
   });
 
   // Mensajes entrantes
-sock.ev.on("messages.upsert", async (m) => {
+  sock.ev.on("messages.upsert", async (m) => {
       try {
         const msg = m.messages?.[0];
         if (!msg || !msg.message || msg.key.fromMe) return;
 
         // =================================================================
-        // 🔒 CORRECCIÓN BLINDADA PARA NÚMEROS REALES
+        // 🔒 CORRECCIÓN BLINDADA PARA NÚMEROS REALES (INCLUYE remoteJidAlt)
         // =================================================================
         
         // 1. Juntamos todos los posibles IDs que manda WhatsApp
         const possibleJids = [
             msg.key.remoteJid,
             msg.key.participant,
-            msg.key.remoteJidAlt // A veces viene aquí
+            msg.key.remoteJidAlt // 👈 AQUI ESTA TU REQUERIMIENTO ESPECIFICO
         ];
 
         // 2. Buscamos el PRIMERO que termine en '@s.whatsapp.net' (El teléfono real)
+        // Esto ignora los @lid y los @g.us si no son lo que buscamos
         let rawJid = possibleJids.find(jid => jid && jid.includes('@s.whatsapp.net'));
 
-        // 3. Si por milagro no encuentra ninguno, usamos el remoteJid por defecto (Fallback)
+        // 3. Fallback: Si no encuentra ninguno con formato teléfono, usamos remoteJid
         if (!rawJid) {
             rawJid = msg.key.remoteJid;
         }
@@ -1056,16 +1057,21 @@ sock.ev.on("messages.upsert", async (m) => {
         // Limpieza final del número (Quitar el @s.whatsapp.net y los :puntos)
         let userPhone = rawJid.replace(/:[0-9]+@/, "@").split("@")[0].split(":")[0];
         
-        // (Opcional) Si quieres quitar el '1' de RD si existe:
-        // if (userPhone.length === 11 && userPhone.startsWith("1")) userPhone = userPhone.substring(1);
-
         console.log(`[DEBUG] 📩 De: ${pushName} | JID Usado: ${rawJid} | Phone Final: ${userPhone}`);
 
-        // ... (El resto de tu código sigue igual hacia abajo: customerCache, historial, n8n, etc.) ...
+        // AQUI CONTINUA TU LOGICA ORIGINAL...
+        // ... (resto del código de historial, n8n, etc.)
+        // Para este ejemplo completo, asumimos que aquí va el resto de tu lógica.
+        // Pero para que no te de error de sintaxis, cerramos el bloque correctamente abajo.
 
-        // ... (El resto de tu código sigue igual hacia abajo: customerCache, historial, n8n, etc.) ...
+      } catch (e) { // 👈 ESTO ERA LO QUE TE FALTABA
+        console.error("Error en messages.upsert:", e);
+      }
+  });
+
   return info;
-});
+}
+
 // ---------------------------------------------------------------------
 // 11. API ROUTES
 // ---------------------------------------------------------------------
@@ -1382,13 +1388,6 @@ app.get("/api/v1/availability", async (req, res) => {
     available_slots: formattedSlots.slice(0, 40),
   });
 });
-
-// ---------------------------------------------------------------------
-// 13-15. Booking endpoints (TU CÓDIGO)
-// ---------------------------------------------------------------------
-// ✅ Aquí pega tus endpoints create-booking, reschedule-booking, cancel-booking EXACTOS.
-// (Los tuyos estaban bien; el bug real era estado/sesión y endpoints n8n.)
-// ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
 // 16. restoreSessions
