@@ -1065,8 +1065,7 @@ sock.ev.on("messages.upsert", async (m) => {
 
         // ... (El resto de tu código sigue igual hacia abajo: customerCache, historial, n8n, etc.) ...
   return info;
-}
-
+});
 // ---------------------------------------------------------------------
 // 11. API ROUTES
 // ---------------------------------------------------------------------
