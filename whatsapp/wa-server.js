@@ -1,9 +1,9 @@
 /**
- * wa-server.js — VERSIÓN PRODUCCIÓN HÍBRIDA (N8N + NUCLEAR CONNECT)
+ * wa-server.js — VERSIÓN FINAL CORREGIDA (N8N + NUCLEAR FIX)
  *
- * ✅ CEREBRO: n8n (vía Webhook) con Fallback a OpenAI.
- * ✅ CONEXIÓN: Nuclear (Borra carpeta física en /connect para garantizar QR).
- * ✅ ESTABILIDAD: Browser Ubuntu para evitar rechazos de WhatsApp.
+ * ✅ CEREBRO: n8n (Prioridad) + OpenAI (Fallback).
+ * ✅ CONEXIÓN: Nuclear (Borrado físico de sesión + Tiempos de espera).
+ * ✅ COMPATIBILIDAD: Browser "Creativa Web" en Windows (Universal).
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -90,6 +90,24 @@ try {
   if (!fs.existsSync(WA_SESSIONS_ROOT)) fs.mkdirSync(WA_SESSIONS_ROOT, { recursive: true });
 } catch (e) {
   console.error("[wa-server] No pude crear WA_SESSIONS_ROOT:", WA_SESSIONS_ROOT, e);
+}
+
+// ---------------------------------------------------------------------
+// HELPERS DE UTILIDAD (Sleep & Normalize)
+// ---------------------------------------------------------------------
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForConnected(tenantId, timeoutMs = 15000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const s = sessions.get(tenantId);
+    if (s?.status === "connected" && s?.socket) return s;
+    await sleep(500);
+  }
+  return sessions.get(tenantId) || null;
 }
 
 // =====================================================================
@@ -1037,12 +1055,13 @@ async function getOrCreateSession(tenantId) {
   const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
   const { state, saveCreds } = await useSupabaseAuthState(tenantId);
 
-  // 🔥 CONFIGURACIÓN NUCLEAR: BROWSER FIX + TIMEOUTS
+  // 🔥 CONFIGURACIÓN NUCLEAR: BROWSER "Creativa Web" (Universal) + TIMEOUTS
   const sock = makeWASocket({
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ["Ubuntu", "Chrome", "20.0.04"], // <-- Se hace pasar por Ubuntu para estabilidad
+    // Browser universal para evitar bloqueos
+    browser: ["Creativa Web", "Chrome", "10.0.0"],
     syncFullHistory: false,
     connectTimeoutMs: 60000, 
     keepAliveIntervalMs: 10000, 
@@ -1107,7 +1126,7 @@ async function getOrCreateSession(tenantId) {
     }
   });
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", async () => { await saveCreds(); });
 
   sock.ev.on("messages.upsert", async (m) => {
     try {
@@ -1118,14 +1137,8 @@ async function getOrCreateSession(tenantId) {
 
       if (!msg?.message || msg.key.fromMe) return;
 
-      // FIX DE JIDs (Para que funcione con cualquier celular y remoteJidAlt)
-      const possibleJids = [msg.key.remoteJid, msg.key.participant, msg.key.remoteJidAlt];
-      let rawJid = possibleJids.find(jid => jid && jid.includes('@s.whatsapp.net'));
-      if (!rawJid) rawJid = msg.key.remoteJid;
-      if (!rawJid || rawJid.includes("@g.us")) return;
-
-      // Efecto escribiendo inmediato
-      await sock.sendPresenceUpdate('composing', rawJid);
+      const remoteJid = msg.key.remoteJid;
+      if (!remoteJid || remoteJid.includes("@g.us")) return;
 
       const text =
         msg.message.conversation ||
@@ -1135,7 +1148,7 @@ async function getOrCreateSession(tenantId) {
       if (!text) return;
 
       const pushName = msg.pushName || "Cliente";
-      const userPhone = rawJid.split("@")[0].split(":")[0];
+      const userPhone = remoteJid.split("@")[0];
 
       if (!info.conversations) info.conversations = new Map();
 
@@ -1230,11 +1243,10 @@ async function getOrCreateSession(tenantId) {
         }
       }
 
-      // Usamos rawJid (el JID corregido) para responder
-      await sock.sendMessage(rawJid, { text: replyText });
+      await sock.sendMessage(remoteJid, { text: replyText });
 
       if (icsData) {
-        const ok = await sendICS(sock, rawJid, icsData, {
+        const ok = await sendICS(sock, remoteJid, icsData, {
           fileName: "cita_confirmada.ics",
           caption: "📅 Toca aquí para guardar/actualizar tu cita en el calendario",
         });
@@ -1293,7 +1305,7 @@ app.get("/sessions/:tenantId", async (req, res) => {
   });
 });
 
-// 🔥 CONNECT NUCLEAR MEJORADO (AQUÍ ESTÁ LA MAGIA)
+// 🔥 CONNECT NUCLEAR MEJORADO (CON WAIT)
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
 
@@ -1312,12 +1324,14 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
       }
     }
 
-    // 3. 🔥 BORRADO FÍSICO DE CARPETA (Nuclear Fix)
+    // 3. 🔥 BORRADO FÍSICO DE CARPETA + ESPERA (Nuclear Fix)
     const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
     if (fs.existsSync(sessionFolder)) {
       try {
         fs.rmSync(sessionFolder, { recursive: true, force: true });
-        logger.info({ tenantId }, "🗑️ Carpeta de sesión eliminada para forzar conexión limpia.");
+        // 👇 ESTE ES EL SECRETO: Esperar que el disco termine de borrar
+        await sleep(2000); 
+        logger.info({ tenantId }, "🗑️ Carpeta de sesión eliminada.");
       } catch (err) {
         logger.error({ tenantId, err }, "No se pudo borrar la carpeta de sesión.");
       }
@@ -1326,8 +1340,8 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
     // 4. Crear nueva sesión fresca
     const info = await getOrCreateSession(tenantId);
     
-    // Esperar un poco para dar tiempo al QR
-    await new Promise(resolve => setTimeout(resolve, 2500));
+    // Esperar un poco para dar tiempo al QR real
+    await waitForConnected(tenantId, 3000);
 
     return res.json({ ok: true, status: info.status || "connecting" });
   } catch (e) {
