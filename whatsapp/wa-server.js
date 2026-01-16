@@ -13,6 +13,7 @@
  * 2. /connect: NUCLEAR FIX -> Mata memoria, Borra disco y Resetea DB sin preguntar.
  * 3. JID FIX: Prioridad a remoteJidAlt o cualquiera que tenga @s.whatsapp.net.
  * 4. BROWSER FIX: Usamos "Ubuntu" para mayor estabilidad.
+ * 5. 🧠 BRAIN FIX: Se activó la respuesta de la IA en messages.upsert.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -1025,11 +1026,10 @@ async function getOrCreateSession(tenantId) {
         const possibleJids = [
             msg.key.remoteJid,
             msg.key.participant,
-            msg.key.remoteJidAlt // 👈 AQUI ESTA TU REQUERIMIENTO ESPECIFICO
+            msg.key.remoteJidAlt
         ];
 
         // 2. Buscamos el PRIMERO que termine en '@s.whatsapp.net' (El teléfono real)
-        // Esto ignora los @lid y los @g.us si no son lo que buscamos
         let rawJid = possibleJids.find(jid => jid && jid.includes('@s.whatsapp.net'));
 
         // 3. Fallback: Si no encuentra ninguno con formato teléfono, usamos remoteJid
@@ -1056,17 +1056,23 @@ async function getOrCreateSession(tenantId) {
 
         const pushName = msg.pushName || "Cliente";
         
-        // Limpieza final del número (Quitar el @s.whatsapp.net y los :puntos)
+        // Limpieza final del número
         let userPhone = rawJid.replace(/:[0-9]+@/, "@").split("@")[0].split(":")[0];
         
         console.log(`[DEBUG] 📩 De: ${pushName} | JID Usado: ${rawJid} | Phone Final: ${userPhone}`);
 
-        // AQUI CONTINUA TU LOGICA ORIGINAL...
-        // ... (resto del código de historial, n8n, etc.)
-        // Para este ejemplo completo, asumimos que aquí va el resto de tu lógica.
-        // Pero para que no te de error de sintaxis, cerramos el bloque correctamente abajo.
+        // 👇 AQUI ESTÁ LA MAGIA QUE FALTABA
+        // ----------------------------------------------------
+        // Llama a la IA para obtener la respuesta
+        const replyText = await generateReply(text, tenantId, pushName, [], userPhone);
+        
+        // Si la IA devuelve texto, lo enviamos de vuelta
+        if (replyText) {
+             await sock.sendMessage(rawJid, { text: replyText });
+        }
+        // ----------------------------------------------------
 
-      } catch (e) { // 👈 ESTO ERA LO QUE TE FALTABA
+      } catch (e) {
         console.error("Error en messages.upsert:", e);
       }
   });
