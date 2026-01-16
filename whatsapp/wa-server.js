@@ -10,8 +10,9 @@
  *
  * 🛠️ CORRECCIONES APLICADAS:
  * 1. restoreSessions: Solo revive 'connected' para evitar spam de QRs en logs.
- * 2. /connect: Fuerza limpieza de sesión previa para garantizar QR fresco.
+ * 2. /connect: Fuerza limpieza de sesión previa (FILESYSTEM) para garantizar QR fresco.
  * 3. JID FIX: Prioridad a remoteJidAlt o cualquiera que tenga @s.whatsapp.net.
+ * 4. BROWSER FIX: Cambiado a "Ubuntu" para evitar rechazo de conexión.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -925,13 +926,16 @@ async function getOrCreateSession(tenantId) {
   const { default: makeWASocket, DisconnectReason } = await import("@whiskeysockets/baileys");
   const { state, saveCreds } = await useFileAuthState(tenantId);
 
+  // 🔥 FIX 3 & 4: Browser Ubuntu y Timeouts aumentados
   const sock = makeWASocket({
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ["PymeBot", "Chrome", "1.0.0"],
+    browser: ["Ubuntu", "Chrome", "20.0.04"], // <-- Se hace pasar por Ubuntu
     syncFullHistory: false,
-    connectTimeoutMs: 60000,
+    connectTimeoutMs: 60000, 
+    keepAliveIntervalMs: 10000, 
+    retryRequestDelayMs: 5000,
   });
 
   const info = {
@@ -1131,18 +1135,34 @@ app.get("/sessions/:tenantId", async (req, res) => {
   });
 });
 
-// 🔥 CORRECCIÓN 2: Fuerza limpieza para evitar QR viejo
+// 🔥 CORRECCIÓN 2 MEJORADA: Borrado FÍSICO de carpeta para garantizar QR virgen
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
   try {
-    // 1. Matar sesión vieja si existe y está trabada
+    // 1. Matar sesión vieja si existe
     const existing = sessions.get(tenantId);
-    if (existing && existing.status !== "connected") {
-      try { await existing.socket.logout(); } catch(e) {}
-      sessions.delete(tenantId);
+    if (existing) {
+      try { 
+        // Intentamos cerrar socket suavemente
+        existing.socket.end(undefined); 
+        sessions.delete(tenantId);
+      } catch(e) {
+        console.error("Error cerrando socket viejo:", e);
+      }
     }
 
-    // 2. Crear nueva fresca
+    // 2. 🔥 ELIMINAR CARPETA DE SESIÓN (La clave del éxito)
+    const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
+    if (fs.existsSync(sessionFolder)) {
+      try {
+        fs.rmSync(sessionFolder, { recursive: true, force: true });
+        logger.info({ tenantId }, "🗑️ Carpeta de sesión eliminada para forzar conexión limpia.");
+      } catch (err) {
+        logger.error({ tenantId, err }, "No se pudo borrar la carpeta de sesión.");
+      }
+    }
+
+    // 3. Crear nueva fresca
     const info = await getOrCreateSession(tenantId);
     
     // espera un poco por si conecta rápido
