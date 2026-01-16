@@ -10,9 +10,9 @@
  *
  * 🛠️ CORRECCIONES APLICADAS:
  * 1. restoreSessions: Solo revive 'connected' para evitar spam de QRs en logs.
- * 2. /connect: Fuerza limpieza de sesión previa (FILESYSTEM) para garantizar QR fresco.
+ * 2. /connect: NUCLEAR FIX -> Mata memoria, Borra disco y Resetea DB sin preguntar.
  * 3. JID FIX: Prioridad a remoteJidAlt o cualquiera que tenga @s.whatsapp.net.
- * 4. BROWSER FIX: Cambiado a "Ubuntu" para evitar rechazo de conexión.
+ * 4. BROWSER FIX: Usamos "Ubuntu" para mayor estabilidad.
  */
 
 require("dotenv").config({ path: ".env.local" });
@@ -50,10 +50,8 @@ app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || process.env.WA_SERVER_PORT || 4001;
 
-// 🔥 AJUSTE DE ZONA HORARIA (tu lógica actual)
+// 🔥 AJUSTE DE ZONA HORARIA
 const SERVER_OFFSET_HOURS = 4;
-
-// Timezone configurable (fallback RD)
 const TIMEZONE_LOCALE = process.env.TIMEZONE_LOCALE || "America/Santo_Domingo";
 
 const logger = P({
@@ -108,7 +106,7 @@ try {
 
 function requireAuth(req, res, next) {
   const expected = String(process.env.WA_API_TOKEN || "").trim();
-  if (!expected) return next(); // si no hay token, no bloquea
+  if (!expected) return next();
 
   const auth = String(req.headers.authorization || "");
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
@@ -120,7 +118,7 @@ function requireAuth(req, res, next) {
 }
 
 // ---------------------------------------------------------------------
-// HELPERS: Normalización teléfono → WhatsApp JID
+// HELPERS
 // ---------------------------------------------------------------------
 
 function normalizePhoneDigits(input) {
@@ -1135,11 +1133,15 @@ app.get("/sessions/:tenantId", async (req, res) => {
   });
 });
 
-// 🔥 CORRECCIÓN 2 MEJORADA: Borrado FÍSICO de carpeta para garantizar QR virgen
+// 🔥 CORRECCIÓN 2 MEJORADA: Borrado TOTAL (Memoria + Disco + DB)
 app.post("/sessions/:tenantId/connect", async (req, res) => {
   const tenantId = req.params.tenantId;
   try {
-    // 1. Matar sesión vieja si existe
+    
+    // 1. Limpieza de DB (Para que nadie crea que estamos conectados)
+    await updateSessionDB(tenantId, { status: "disconnected", qr_data: null });
+
+    // 2. Matar sesión vieja en Memoria
     const existing = sessions.get(tenantId);
     if (existing) {
       try { 
@@ -1151,7 +1153,7 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
       }
     }
 
-    // 2. 🔥 ELIMINAR CARPETA DE SESIÓN (La clave del éxito)
+    // 3. 🔥 ELIMINAR CARPETA DE SESIÓN (Físico)
     const sessionFolder = path.join(WA_SESSIONS_ROOT, String(tenantId));
     if (fs.existsSync(sessionFolder)) {
       try {
@@ -1162,7 +1164,7 @@ app.post("/sessions/:tenantId/connect", async (req, res) => {
       }
     }
 
-    // 3. Crear nueva fresca
+    // 4. Crear nueva fresca
     const info = await getOrCreateSession(tenantId);
     
     // espera un poco por si conecta rápido
